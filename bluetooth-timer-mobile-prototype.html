@@ -1,0 +1,2215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#eef3f7">
+  <title>轻时 · 蓝牙定时器移动端样稿</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font: 100%/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Display",
+        "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      --ink: #111317;
+      --secondary: #69717d;
+      --tertiary: #969eaa;
+      --blue: #1687f8;
+      --blue-deep: #0874df;
+      --cyan: #5cc8fa;
+      --green: #2dbb71;
+      --orange: #ff9f3e;
+      --red: #ff5d57;
+      --surface: rgba(255, 255, 255, 0.82);
+      --surface-solid: #ffffff;
+      --line: rgba(31, 42, 55, 0.075);
+      --soft-shadow: 0 0.75rem 2rem rgba(40, 61, 82, 0.09);
+      --deep-shadow: 0 2rem 5rem rgba(24, 45, 65, 0.18);
+      --radius-xl: 1.75rem;
+      --radius-lg: 1.35rem;
+      --radius-md: 1rem;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+    }
+
+    body {
+      display: grid;
+      min-height: 100dvh;
+      place-items: center;
+      overflow: hidden;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 22% 18%, rgba(116, 208, 255, 0.3), transparent 31rem),
+        radial-gradient(circle at 78% 78%, rgba(130, 164, 255, 0.2), transparent 28rem),
+        #eaf0f5;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    button:focus-visible {
+      outline: 0.2rem solid rgba(22, 135, 248, 0.35);
+      outline-offset: 0.15rem;
+    }
+
+    .ambient {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .ambient::before,
+    .ambient::after {
+      position: absolute;
+      width: 28rem;
+      height: 28rem;
+      border-radius: 50%;
+      content: "";
+      filter: blur(2rem);
+      opacity: 0.33;
+    }
+
+    .ambient::before {
+      top: -14rem;
+      right: -8rem;
+      background: #8cd9ff;
+    }
+
+    .ambient::after {
+      bottom: -17rem;
+      left: -9rem;
+      background: #a8b9ff;
+    }
+
+    .prototype {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      justify-items: center;
+      gap: 1.15rem;
+      padding: 1.5rem;
+    }
+
+    .phone-shell {
+      position: relative;
+      width: min(24.375rem, calc(100vw - 2rem));
+      height: min(52.75rem, calc(100dvh - 6rem));
+      min-height: 40rem;
+      padding: 0.42rem;
+      overflow: hidden;
+      border: 0.06rem solid rgba(255, 255, 255, 0.9);
+      border-radius: 3.15rem;
+      background: rgba(18, 23, 30, 0.92);
+      box-shadow:
+        0 0 0 0.06rem rgba(17, 24, 32, 0.8),
+        0 1.75rem 5.5rem rgba(19, 37, 55, 0.25);
+    }
+
+    .phone {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      border-radius: 2.75rem;
+      background: #f4f7fa;
+      isolation: isolate;
+    }
+
+    .phone::before {
+      position: absolute;
+      z-index: 20;
+      top: 0.75rem;
+      left: 50%;
+      width: 6.4rem;
+      height: 1.75rem;
+      border-radius: 2rem;
+      background: #080a0d;
+      content: "";
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    .status-bar {
+      position: absolute;
+      z-index: 15;
+      top: 0;
+      right: 0;
+      left: 0;
+      display: flex;
+      height: 3.2rem;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 1.35rem;
+      color: #17191d;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.015em;
+      pointer-events: none;
+    }
+
+    .status-icons {
+      display: flex;
+      align-items: center;
+      gap: 0.33rem;
+    }
+
+    .cellular {
+      display: flex;
+      height: 0.7rem;
+      align-items: flex-end;
+      gap: 0.08rem;
+    }
+
+    .cellular i {
+      display: block;
+      width: 0.13rem;
+      border-radius: 0.1rem;
+      background: currentColor;
+    }
+
+    .cellular i:nth-child(1) { height: 0.25rem; }
+    .cellular i:nth-child(2) { height: 0.38rem; }
+    .cellular i:nth-child(3) { height: 0.53rem; }
+    .cellular i:nth-child(4) { height: 0.68rem; }
+
+    .wifi {
+      width: 0.8rem;
+      height: 0.58rem;
+      border: 0.12rem solid currentColor;
+      border-bottom: 0;
+      border-radius: 0.8rem 0.8rem 0 0;
+      clip-path: polygon(0 0, 100% 0, 65% 100%, 35% 100%);
+    }
+
+    .battery {
+      position: relative;
+      width: 1.25rem;
+      height: 0.62rem;
+      padding: 0.08rem;
+      border: 0.08rem solid currentColor;
+      border-radius: 0.2rem;
+    }
+
+    .battery::before {
+      display: block;
+      width: 78%;
+      height: 100%;
+      border-radius: 0.08rem;
+      background: currentColor;
+      content: "";
+    }
+
+    .battery::after {
+      position: absolute;
+      top: 50%;
+      right: -0.2rem;
+      width: 0.11rem;
+      height: 0.28rem;
+      border-radius: 0 0.08rem 0.08rem 0;
+      background: currentColor;
+      content: "";
+      transform: translateY(-50%);
+    }
+
+    .viewport {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      touch-action: pan-y;
+    }
+
+    .screen-track {
+      display: flex;
+      width: 300%;
+      height: 100%;
+      will-change: transform;
+    }
+
+    .screen {
+      position: relative;
+      width: 33.333333%;
+      height: 100%;
+      flex: 0 0 33.333333%;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior-y: contain;
+      scrollbar-width: none;
+      background:
+        radial-gradient(circle at 88% 4%, rgba(119, 210, 255, 0.16), transparent 15rem),
+        linear-gradient(180deg, #f7fafc 0%, #f1f5f8 100%);
+    }
+
+    .screen::-webkit-scrollbar {
+      display: none;
+    }
+
+    .screen-content {
+      min-height: 100%;
+      padding: 3.65rem 1.25rem 6.5rem;
+    }
+
+    .topbar {
+      display: flex;
+      min-height: 3.65rem;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .eyebrow {
+      margin: 0 0 0.12rem;
+      color: var(--blue);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 0;
+      font-size: clamp(1.75rem, 7vw, 2.05rem);
+      font-weight: 750;
+      line-height: 1.1;
+      letter-spacing: -0.035em;
+    }
+
+    h2 {
+      margin-bottom: 0;
+      font-size: 1.15rem;
+      font-weight: 720;
+      line-height: 1.2;
+      letter-spacing: -0.016em;
+    }
+
+    h3 {
+      margin-bottom: 0.12rem;
+      font-size: 0.98rem;
+      font-weight: 680;
+      line-height: 1.25;
+      letter-spacing: -0.01em;
+    }
+
+    .icon-button,
+    .back-button {
+      display: inline-grid;
+      width: 2.75rem;
+      height: 2.75rem;
+      flex: 0 0 auto;
+      padding: 0;
+      place-items: center;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.78);
+      box-shadow:
+        inset 0 0 0 0.06rem rgba(255, 255, 255, 0.82),
+        0 0.4rem 1.2rem rgba(38, 59, 78, 0.08);
+      cursor: pointer;
+      backdrop-filter: blur(1.25rem) saturate(160%);
+      -webkit-backdrop-filter: blur(1.25rem) saturate(160%);
+      transition: transform 100ms ease-out, background-color 180ms ease;
+    }
+
+    .icon-button:active,
+    .back-button:active,
+    .primary-button:active,
+    .device-card:active,
+    .quick-chip:active,
+    .action-option:active,
+    .floating-add:active {
+      transform: scale(0.96);
+    }
+
+    .icon {
+      display: block;
+      width: 1.25rem;
+      height: 1.25rem;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.8;
+    }
+
+    .card {
+      border: 0.06rem solid rgba(255, 255, 255, 0.9);
+      border-radius: var(--radius-xl);
+      background: var(--surface);
+      box-shadow: var(--soft-shadow);
+      backdrop-filter: blur(1.5rem) saturate(170%);
+      -webkit-backdrop-filter: blur(1.5rem) saturate(170%);
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(0.55rem);
+      transition:
+        opacity 320ms ease,
+        transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .screen.is-active .reveal {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .screen.is-active .reveal:nth-child(2) { transition-delay: 35ms; }
+    .screen.is-active .reveal:nth-child(3) { transition-delay: 70ms; }
+    .screen.is-active .reveal:nth-child(4) { transition-delay: 105ms; }
+    .screen.is-active .reveal:nth-child(5) { transition-delay: 140ms; }
+
+    /* 扫描设备 */
+    .scan-stage {
+      position: relative;
+      display: grid;
+      height: 13.7rem;
+      margin: 0.2rem 0 0.9rem;
+      place-items: center;
+    }
+
+    .scan-stage::before,
+    .scan-stage::after {
+      position: absolute;
+      border: 0.06rem solid rgba(22, 135, 248, 0.15);
+      border-radius: 50%;
+      content: "";
+    }
+
+    .scan-stage::before {
+      width: 12rem;
+      height: 12rem;
+    }
+
+    .scan-stage::after {
+      width: 9.3rem;
+      height: 9.3rem;
+    }
+
+    .scan-orbit {
+      position: absolute;
+      width: 10.65rem;
+      height: 10.65rem;
+      border-radius: 50%;
+      background: conic-gradient(from 20deg, transparent 0 66%, rgba(22, 135, 248, 0.17) 88%, transparent);
+      opacity: 0;
+      transition: opacity 220ms ease;
+    }
+
+    .is-scanning .scan-orbit {
+      opacity: 1;
+      animation: orbit 2.4s linear infinite;
+    }
+
+    @keyframes orbit {
+      to { transform: rotate(360deg); }
+    }
+
+    .scan-button {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      width: 6.7rem;
+      height: 6.7rem;
+      padding: 0;
+      place-items: center;
+      border: 0;
+      border-radius: 50%;
+      color: white;
+      background:
+        radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.38), transparent 26%),
+        linear-gradient(145deg, #59c9ff, #147ff3 65%, #0871dd);
+      box-shadow:
+        0 1.15rem 2.5rem rgba(17, 127, 233, 0.28),
+        inset 0 0.06rem 0 rgba(255, 255, 255, 0.45);
+      cursor: pointer;
+      transition: transform 100ms ease-out, box-shadow 220ms ease;
+    }
+
+    .scan-button:active {
+      transform: scale(0.965);
+      box-shadow:
+        0 0.65rem 1.55rem rgba(17, 127, 233, 0.25),
+        inset 0 0.06rem 0 rgba(255, 255, 255, 0.45);
+    }
+
+    .scan-button .icon {
+      width: 2.55rem;
+      height: 2.55rem;
+      stroke-width: 1.55;
+    }
+
+    .scan-copy {
+      position: absolute;
+      right: 0;
+      bottom: 0.2rem;
+      left: 0;
+      margin: 0;
+      color: var(--secondary);
+      font-size: 0.8rem;
+      text-align: center;
+    }
+
+    .scan-copy strong {
+      color: var(--ink);
+      font-weight: 670;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0.4rem 0 0.65rem;
+    }
+
+    .section-heading span {
+      color: var(--tertiary);
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .device-list {
+      display: grid;
+      gap: 0.65rem;
+    }
+
+    .device-card {
+      position: relative;
+      display: flex;
+      width: 100%;
+      min-height: 4.8rem;
+      align-items: center;
+      gap: 0.8rem;
+      padding: 0.75rem;
+      border: 0.06rem solid rgba(255, 255, 255, 0.9);
+      border-radius: 1.35rem;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.79);
+      box-shadow: 0 0.5rem 1.5rem rgba(42, 65, 85, 0.07);
+      cursor: pointer;
+      text-align: left;
+      backdrop-filter: blur(1.25rem) saturate(160%);
+      -webkit-backdrop-filter: blur(1.25rem) saturate(160%);
+      transition:
+        transform 100ms ease-out,
+        border-color 180ms ease,
+        background-color 180ms ease;
+    }
+
+    .device-card:hover {
+      border-color: rgba(22, 135, 248, 0.2);
+    }
+
+    .device-symbol {
+      display: grid;
+      width: 3.25rem;
+      height: 3.25rem;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 1rem;
+      color: var(--blue);
+      background: linear-gradient(145deg, #e8f6ff, #dceeff);
+    }
+
+    .device-symbol .icon {
+      width: 1.55rem;
+      height: 1.55rem;
+    }
+
+    .device-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .device-copy p {
+      margin: 0;
+      overflow: hidden;
+      color: var(--secondary);
+      font-size: 0.76rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .signal {
+      display: flex;
+      width: 2.6rem;
+      flex: 0 0 auto;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.08rem;
+      color: var(--blue);
+    }
+
+    .signal i {
+      display: block;
+      width: 0.16rem;
+      border-radius: 0.2rem;
+      background: currentColor;
+    }
+
+    .signal i:nth-child(1) { height: 0.3rem; }
+    .signal i:nth-child(2) { height: 0.52rem; }
+    .signal i:nth-child(3) { height: 0.75rem; }
+    .signal i:nth-child(4) { height: 0.98rem; }
+    .signal.weak i:nth-child(n+3) { opacity: 0.18; }
+
+    .connection-action {
+      color: var(--blue);
+      font-size: 0.76rem;
+      font-weight: 680;
+    }
+
+    .privacy-note {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.5rem;
+      margin: 0.85rem 0 0;
+      padding: 0 0.2rem;
+      color: var(--tertiary);
+      font-size: 0.69rem;
+      line-height: 1.45;
+    }
+
+    .privacy-note .icon {
+      width: 0.92rem;
+      height: 0.92rem;
+      flex: 0 0 auto;
+      margin-top: 0.06rem;
+    }
+
+    /* 任务总览 */
+    .avatar {
+      position: relative;
+      display: grid;
+      width: 2.75rem;
+      height: 2.75rem;
+      place-items: center;
+      border: 0.18rem solid rgba(255, 255, 255, 0.9);
+      border-radius: 50%;
+      color: #2678c7;
+      background: linear-gradient(145deg, #dff3ff, #bce0ff);
+      box-shadow: 0 0.5rem 1.3rem rgba(32, 89, 141, 0.1);
+      font-size: 0.78rem;
+      font-weight: 780;
+    }
+
+    .avatar::after {
+      position: absolute;
+      right: -0.03rem;
+      bottom: -0.03rem;
+      width: 0.62rem;
+      height: 0.62rem;
+      border: 0.13rem solid #f7fafc;
+      border-radius: 50%;
+      background: var(--green);
+      content: "";
+    }
+
+    .connection-strip {
+      display: flex;
+      align-items: center;
+      gap: 0.68rem;
+      margin-bottom: 0.85rem;
+      padding: 0.72rem 0.85rem;
+      border: 0.06rem solid rgba(255, 255, 255, 0.92);
+      border-radius: 1.15rem;
+      background: rgba(255, 255, 255, 0.7);
+      box-shadow: 0 0.35rem 1.1rem rgba(46, 68, 88, 0.055);
+    }
+
+    .status-dot {
+      width: 0.56rem;
+      height: 0.56rem;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 0.25rem rgba(45, 187, 113, 0.11);
+    }
+
+    .connection-strip strong {
+      display: block;
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      font-size: 0.8rem;
+      font-weight: 670;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .connection-strip span {
+      color: var(--secondary);
+      font-size: 0.7rem;
+    }
+
+    .next-task {
+      position: relative;
+      min-height: 13.2rem;
+      overflow: hidden;
+      padding: 1.2rem;
+      color: white;
+      border-radius: 2rem;
+      background:
+        radial-gradient(circle at 82% 20%, rgba(255, 255, 255, 0.25), transparent 28%),
+        linear-gradient(145deg, #59c7fa 0%, #278fec 48%, #176ddb 100%);
+      box-shadow: 0 1.4rem 2.9rem rgba(28, 116, 206, 0.24);
+    }
+
+    .next-task::before {
+      position: absolute;
+      right: -3.5rem;
+      bottom: -5rem;
+      width: 13rem;
+      height: 13rem;
+      border: 2rem solid rgba(255, 255, 255, 0.07);
+      border-radius: 50%;
+      content: "";
+    }
+
+    .next-label {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      margin-bottom: 1.1rem;
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 0.72rem;
+      font-weight: 680;
+      letter-spacing: 0.035em;
+    }
+
+    .next-label::before {
+      width: 0.42rem;
+      height: 0.42rem;
+      border-radius: 50%;
+      background: white;
+      box-shadow: 0 0 0 0.25rem rgba(255, 255, 255, 0.13);
+      content: "";
+    }
+
+    .next-layout {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .countdown-number {
+      margin: 0;
+      font-size: 3.7rem;
+      font-variant-numeric: tabular-nums;
+      font-weight: 720;
+      line-height: 0.95;
+      letter-spacing: -0.06em;
+    }
+
+    .countdown-unit {
+      margin: 0.4rem 0 0;
+      color: rgba(255, 255, 255, 0.72);
+      font-size: 0.78rem;
+    }
+
+    .action-orb {
+      display: grid;
+      width: 4.3rem;
+      height: 4.3rem;
+      flex: 0 0 auto;
+      place-items: center;
+      border: 0.06rem solid rgba(255, 255, 255, 0.24);
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.16);
+      box-shadow:
+        inset 0 0 0 0.06rem rgba(255, 255, 255, 0.08),
+        0 0.7rem 1.8rem rgba(0, 55, 116, 0.12);
+      backdrop-filter: blur(1rem);
+      -webkit-backdrop-filter: blur(1rem);
+    }
+
+    .action-orb .icon {
+      width: 1.85rem;
+      height: 1.85rem;
+      stroke-width: 1.65;
+    }
+
+    .next-description {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 0.42rem;
+      margin: 1.15rem 0 0;
+      color: rgba(255, 255, 255, 0.92);
+      font-size: 0.8rem;
+      font-weight: 620;
+    }
+
+    .next-description .icon {
+      width: 1rem;
+      height: 1rem;
+    }
+
+    .task-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 1.25rem 0 0.65rem;
+    }
+
+    .task-heading button {
+      padding: 0.35rem 0.1rem;
+      border: 0;
+      color: var(--blue);
+      background: transparent;
+      font-size: 0.76rem;
+      font-weight: 680;
+      cursor: pointer;
+    }
+
+    .task-list {
+      overflow: hidden;
+      padding: 0 0.9rem;
+      border-radius: 1.55rem;
+    }
+
+    .task-row {
+      position: relative;
+      display: flex;
+      width: 100%;
+      min-height: 4.55rem;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.62rem 0;
+      border: 0;
+      border-bottom: 0.06rem solid var(--line);
+      color: inherit;
+      background: transparent;
+      text-align: left;
+    }
+
+    .task-row:last-child {
+      border-bottom: 0;
+    }
+
+    .task-main {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      gap: 0.68rem;
+      cursor: pointer;
+    }
+
+    .task-icon {
+      display: grid;
+      width: 2.65rem;
+      height: 2.65rem;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 0.9rem;
+      color: var(--orange);
+      background: rgba(255, 159, 62, 0.11);
+    }
+
+    .task-icon.on {
+      color: var(--blue);
+      background: rgba(22, 135, 248, 0.1);
+    }
+
+    .task-icon .icon {
+      width: 1.3rem;
+      height: 1.3rem;
+    }
+
+    .task-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .task-copy p {
+      margin: 0.16rem 0 0;
+      overflow: hidden;
+      color: var(--secondary);
+      font-size: 0.69rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .switch {
+      position: relative;
+      width: 2.85rem;
+      height: 1.72rem;
+      flex: 0 0 auto;
+      padding: 0;
+      border: 0;
+      border-radius: 2rem;
+      background: #d8dde3;
+      cursor: pointer;
+      transition: background-color 180ms ease;
+    }
+
+    .switch::after {
+      position: absolute;
+      top: 0.16rem;
+      left: 0.16rem;
+      width: 1.4rem;
+      height: 1.4rem;
+      border-radius: 50%;
+      background: white;
+      box-shadow: 0 0.15rem 0.45rem rgba(31, 43, 55, 0.18);
+      content: "";
+      transition: transform 260ms cubic-bezier(0.2, 0.9, 0.25, 1.15);
+    }
+
+    .switch[aria-checked="true"] {
+      background: var(--green);
+    }
+
+    .switch[aria-checked="true"]::after {
+      transform: translateX(1.13rem);
+    }
+
+    .floating-add {
+      position: absolute;
+      z-index: 10;
+      right: 1.25rem;
+      bottom: calc(1.25rem + env(safe-area-inset-bottom));
+      display: flex;
+      min-width: 9.25rem;
+      height: 3.35rem;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0 1.15rem;
+      border: 0.06rem solid rgba(255, 255, 255, 0.45);
+      border-radius: 2rem;
+      color: white;
+      background: rgba(18, 130, 239, 0.91);
+      box-shadow: 0 1rem 2.3rem rgba(23, 111, 196, 0.3);
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 690;
+      backdrop-filter: blur(1.25rem) saturate(170%);
+      -webkit-backdrop-filter: blur(1.25rem) saturate(170%);
+      transition: transform 100ms ease-out, background-color 180ms ease;
+    }
+
+    .floating-add .icon {
+      width: 1.1rem;
+      height: 1.1rem;
+      stroke-width: 2.2;
+    }
+
+    /* 新建 / 编辑任务 */
+    .editor-topbar {
+      align-items: center;
+      margin-bottom: 0.9rem;
+    }
+
+    .editor-title {
+      flex: 1;
+      text-align: center;
+    }
+
+    .editor-title h1 {
+      font-size: 1.15rem;
+      letter-spacing: -0.015em;
+    }
+
+    .topbar-spacer {
+      width: 2.75rem;
+      flex: 0 0 auto;
+    }
+
+    .device-context {
+      display: flex;
+      align-items: center;
+      gap: 0.68rem;
+      margin-bottom: 0.9rem;
+      padding: 0.72rem 0.82rem;
+      border-radius: 1.15rem;
+    }
+
+    .device-context .device-symbol {
+      width: 2.55rem;
+      height: 2.55rem;
+      border-radius: 0.82rem;
+    }
+
+    .device-context .device-symbol .icon {
+      width: 1.25rem;
+      height: 1.25rem;
+    }
+
+    .context-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .context-copy strong {
+      display: block;
+      overflow: hidden;
+      font-size: 0.8rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .context-copy span {
+      display: block;
+      margin-top: 0.08rem;
+      color: var(--green);
+      font-size: 0.67rem;
+      font-weight: 620;
+    }
+
+    .section-label {
+      margin: 0 0 0.52rem 0.2rem;
+      color: var(--secondary);
+      font-size: 0.72rem;
+      font-weight: 680;
+    }
+
+    .action-segment {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.55rem;
+      margin-bottom: 1rem;
+      padding: 0.35rem;
+      border-radius: 1.4rem;
+      background: rgba(222, 229, 236, 0.72);
+    }
+
+    .action-option {
+      display: flex;
+      min-height: 3.55rem;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.55rem;
+      border: 0;
+      border-radius: 1.08rem;
+      color: var(--secondary);
+      background: transparent;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 680;
+      transition:
+        transform 100ms ease-out,
+        color 180ms ease,
+        background-color 240ms ease,
+        box-shadow 240ms ease;
+    }
+
+    .action-option.is-selected {
+      color: var(--blue);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 0.3rem 0.9rem rgba(45, 67, 87, 0.1);
+    }
+
+    .action-option[data-action="off"].is-selected {
+      color: #e6872a;
+    }
+
+    .action-option .icon {
+      width: 1.25rem;
+      height: 1.25rem;
+    }
+
+    .time-card {
+      position: relative;
+      padding: 0.72rem 0.85rem 0.8rem;
+      overflow: hidden;
+    }
+
+    .picker {
+      position: relative;
+      display: grid;
+      height: 9.4rem;
+      grid-template-columns: 1fr 1fr;
+      align-items: center;
+      gap: 0.35rem;
+      overflow: hidden;
+      mask-image: linear-gradient(to bottom, transparent, black 25%, black 75%, transparent);
+      -webkit-mask-image: linear-gradient(to bottom, transparent, black 25%, black 75%, transparent);
+    }
+
+    .picker::before {
+      position: absolute;
+      z-index: -1;
+      top: 50%;
+      right: 0.05rem;
+      left: 0.05rem;
+      height: 3.05rem;
+      border-radius: 0.95rem;
+      background: rgba(22, 135, 248, 0.075);
+      content: "";
+      transform: translateY(-50%);
+    }
+
+    .wheel-group {
+      position: relative;
+      height: 100%;
+      min-width: 0;
+    }
+
+    .wheel {
+      height: 100%;
+      margin: 0;
+      padding: 3.15rem 1.6rem 3.15rem 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      list-style: none;
+      scroll-snap-type: y mandatory;
+      scrollbar-width: none;
+      touch-action: pan-y;
+    }
+
+    .wheel::-webkit-scrollbar {
+      display: none;
+    }
+
+    .wheel li {
+      display: flex;
+      height: 3.05rem;
+      align-items: center;
+      justify-content: center;
+      color: var(--tertiary);
+      font-size: 1.35rem;
+      font-variant-numeric: tabular-nums;
+      font-weight: 630;
+      scroll-snap-align: center;
+      transition: color 150ms ease, transform 150ms ease;
+    }
+
+    .wheel li.is-current {
+      color: var(--ink);
+      font-size: 2rem;
+      font-weight: 720;
+      letter-spacing: -0.035em;
+      transform: scale(1.03);
+    }
+
+    .wheel-unit {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: 0.42rem;
+      color: var(--secondary);
+      font-size: 0.76rem;
+      font-weight: 620;
+      text-align: center;
+      pointer-events: none;
+      transform: translateY(-50%);
+    }
+
+    .quick-options {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.42rem;
+      margin-top: 0.58rem;
+    }
+
+    .quick-chip {
+      height: 2.15rem;
+      padding: 0 0.2rem;
+      border: 0;
+      border-radius: 0.75rem;
+      color: var(--secondary);
+      background: rgba(232, 237, 242, 0.78);
+      cursor: pointer;
+      font-size: 0.7rem;
+      font-weight: 650;
+      transition:
+        transform 100ms ease-out,
+        color 180ms ease,
+        background-color 180ms ease;
+    }
+
+    .quick-chip.is-selected {
+      color: var(--blue);
+      background: rgba(22, 135, 248, 0.11);
+    }
+
+    .execution-preview {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-top: 0.85rem;
+      padding: 0.8rem 0.85rem;
+      border-radius: 1.15rem;
+    }
+
+    .preview-symbol {
+      display: grid;
+      width: 2.4rem;
+      height: 2.4rem;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--blue);
+      background: rgba(22, 135, 248, 0.1);
+    }
+
+    .preview-symbol .icon {
+      width: 1.1rem;
+      height: 1.1rem;
+    }
+
+    .execution-preview p {
+      margin: 0;
+      color: var(--secondary);
+      font-size: 0.68rem;
+    }
+
+    .execution-preview strong {
+      display: block;
+      margin-top: 0.12rem;
+      font-size: 0.78rem;
+      font-weight: 680;
+    }
+
+    .setting-row {
+      display: flex;
+      min-height: 4.2rem;
+      align-items: center;
+      gap: 0.68rem;
+      margin-top: 0.75rem;
+      padding: 0.68rem 0.82rem;
+      border-radius: 1.2rem;
+    }
+
+    .setting-icon {
+      display: grid;
+      width: 2.35rem;
+      height: 2.35rem;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 0.8rem;
+      color: #7d65d9;
+      background: rgba(125, 101, 217, 0.1);
+    }
+
+    .setting-icon .icon {
+      width: 1.12rem;
+      height: 1.12rem;
+    }
+
+    .setting-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .setting-copy strong {
+      display: block;
+      font-size: 0.78rem;
+    }
+
+    .setting-copy span {
+      display: block;
+      margin-top: 0.12rem;
+      color: var(--secondary);
+      font-size: 0.65rem;
+    }
+
+    .save-area {
+      margin-top: 0.9rem;
+    }
+
+    .primary-button {
+      position: relative;
+      display: flex;
+      width: 100%;
+      height: 3.4rem;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0 1rem;
+      overflow: hidden;
+      border: 0;
+      border-radius: 1.2rem;
+      color: white;
+      background: linear-gradient(135deg, #2698ff, #0874df);
+      box-shadow: 0 0.9rem 1.8rem rgba(21, 119, 216, 0.23);
+      cursor: pointer;
+      font-size: 0.84rem;
+      font-weight: 700;
+      transition: transform 100ms ease-out, filter 180ms ease;
+    }
+
+    .primary-button:disabled {
+      cursor: default;
+      filter: saturate(0.65);
+    }
+
+    .primary-button .icon {
+      width: 1.1rem;
+      height: 1.1rem;
+    }
+
+    .save-note {
+      margin: 0.58rem 0 0;
+      color: var(--tertiary);
+      font-size: 0.66rem;
+      line-height: 1.45;
+      text-align: center;
+    }
+
+    .shake {
+      animation: shake 340ms ease;
+    }
+
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-0.38rem); }
+      50% { transform: translateX(0.32rem); }
+      75% { transform: translateX(-0.18rem); }
+    }
+
+    /* 轻量提示在同一位置出现和离开，保持空间连续性 */
+    .toast {
+      position: absolute;
+      z-index: 40;
+      top: 3.45rem;
+      left: 50%;
+      display: flex;
+      max-width: calc(100% - 2.5rem);
+      min-height: 2.65rem;
+      align-items: center;
+      gap: 0.48rem;
+      padding: 0.58rem 0.85rem;
+      border: 0.06rem solid rgba(255, 255, 255, 0.25);
+      border-radius: 1.1rem;
+      color: white;
+      background: rgba(24, 29, 36, 0.86);
+      box-shadow: 0 0.8rem 2rem rgba(20, 29, 38, 0.2);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, -0.5rem) scale(0.96);
+      backdrop-filter: blur(1.4rem) saturate(160%);
+      -webkit-backdrop-filter: blur(1.4rem) saturate(160%);
+      transition:
+        opacity 180ms ease,
+        transform 320ms cubic-bezier(0.2, 0.85, 0.25, 1.05);
+    }
+
+    .toast.is-visible {
+      opacity: 1;
+      transform: translate(-50%, 0) scale(1);
+    }
+
+    .toast .icon {
+      width: 1rem;
+      height: 1rem;
+      color: #73e2a7;
+    }
+
+    .toast span {
+      overflow: hidden;
+      font-size: 0.72rem;
+      font-weight: 620;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .home-indicator {
+      position: absolute;
+      z-index: 25;
+      bottom: 0.38rem;
+      left: 50%;
+      width: 7.4rem;
+      height: 0.3rem;
+      border-radius: 1rem;
+      background: rgba(10, 12, 15, 0.86);
+      content: "";
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    .prototype-nav {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.3rem;
+      border: 0.06rem solid rgba(255, 255, 255, 0.68);
+      border-radius: 1.15rem;
+      background: rgba(255, 255, 255, 0.56);
+      box-shadow: 0 0.8rem 2rem rgba(45, 66, 84, 0.09);
+      backdrop-filter: blur(1.4rem) saturate(170%);
+      -webkit-backdrop-filter: blur(1.4rem) saturate(170%);
+    }
+
+    .prototype-nav button {
+      min-width: 4.4rem;
+      height: 2.15rem;
+      padding: 0 0.75rem;
+      border: 0;
+      border-radius: 0.85rem;
+      color: var(--secondary);
+      background: transparent;
+      cursor: pointer;
+      font-size: 0.72rem;
+      font-weight: 670;
+      transition:
+        color 180ms ease,
+        background-color 220ms ease,
+        box-shadow 220ms ease,
+        transform 100ms ease-out;
+    }
+
+    .prototype-nav button:active {
+      transform: scale(0.96);
+    }
+
+    .prototype-nav button[aria-current="page"] {
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 0.25rem 0.8rem rgba(42, 62, 81, 0.1);
+    }
+
+    @media (max-width: 520px), (max-height: 720px) {
+      body {
+        display: block;
+        overflow: hidden;
+        background: #f4f7fa;
+      }
+
+      .ambient,
+      .prototype-nav {
+        display: none;
+      }
+
+      .prototype {
+        display: block;
+        width: 100%;
+        height: 100dvh;
+        padding: 0;
+      }
+
+      .phone-shell {
+        width: 100%;
+        height: 100dvh;
+        min-height: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: #f4f7fa;
+        box-shadow: none;
+      }
+
+      .phone {
+        border-radius: 0;
+      }
+
+      .phone::before {
+        display: none;
+      }
+
+      .status-bar {
+        padding-top: env(safe-area-inset-top);
+      }
+
+      .screen-content {
+        padding-top: calc(3.65rem + env(safe-area-inset-top));
+      }
+
+      .home-indicator {
+        bottom: max(0.35rem, env(safe-area-inset-bottom));
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 120ms !important;
+      }
+
+      .reveal {
+        transform: none;
+      }
+    }
+
+    @media (prefers-reduced-transparency: reduce) {
+      .card,
+      .device-card,
+      .icon-button,
+      .back-button,
+      .floating-add,
+      .prototype-nav,
+      .toast {
+        background-color: #ffffff;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+      }
+
+      .floating-add {
+        color: white;
+        background-color: var(--blue);
+      }
+
+      .toast {
+        color: white;
+        background-color: #20242a;
+      }
+    }
+
+    @media (prefers-contrast: more) {
+      .card,
+      .device-card,
+      .connection-strip {
+        border-color: rgba(17, 19, 23, 0.3);
+        background: white;
+      }
+
+      .secondary,
+      .device-copy p,
+      .task-copy p {
+        color: #454b54;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <main class="prototype">
+    <section class="phone-shell" aria-label="轻时蓝牙定时器移动端交互样稿">
+      <div class="phone">
+        <div class="status-bar" aria-hidden="true">
+          <span id="statusTime">9:41</span>
+          <div class="status-icons">
+            <span class="cellular"><i></i><i></i><i></i><i></i></span>
+            <span class="wifi"></span>
+            <span class="battery"></span>
+          </div>
+        </div>
+
+        <div class="viewport" id="viewport">
+          <div class="screen-track" id="screenTrack">
+            <!-- 界面 1：扫描设备 -->
+            <section class="screen is-active" data-screen="0" aria-labelledby="scanTitle">
+              <div class="screen-content" id="scanContent">
+                <header class="topbar reveal">
+                  <div>
+                    <p class="eyebrow">轻时 TIMER</p>
+                    <h1 id="scanTitle">发现设备</h1>
+                  </div>
+                  <button class="icon-button" type="button" aria-label="查看扫描帮助" id="helpButton">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9"></circle>
+                      <path d="M9.8 9a2.35 2.35 0 0 1 4.5.9c0 1.8-2.3 2-2.3 3.5"></path>
+                      <path d="M12 17.2h.01"></path>
+                    </svg>
+                  </button>
+                </header>
+
+                <div class="scan-stage reveal">
+                  <div class="scan-orbit" aria-hidden="true"></div>
+                  <button class="scan-button" type="button" id="scanButton" aria-label="重新扫描蓝牙设备">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m7 7 10 10-5 4V3l5 4L7 17"></path>
+                    </svg>
+                  </button>
+                  <p class="scan-copy" id="scanStatus" aria-live="polite">
+                    <strong>发现 2 台设备</strong> · 点击设备连接
+                  </p>
+                </div>
+
+                <div class="section-heading reveal">
+                  <h2>附近设备</h2>
+                  <span>蓝牙已开启</span>
+                </div>
+
+                <div class="device-list reveal" id="deviceList">
+                  <button class="device-card" type="button" data-device="Porch Timer" aria-label="连接 Porch Timer，信号强">
+                    <span class="device-symbol">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="m7 7 10 10-5 4V3l5 4L7 17"></path>
+                      </svg>
+                    </span>
+                    <span class="device-copy">
+                      <h3>Porch Timer</h3>
+                      <p>YX-T01 · 距离很近</p>
+                    </span>
+                    <span class="signal" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+                    <span class="connection-action">连接</span>
+                  </button>
+
+                  <button class="device-card" type="button" data-device="Garden Light" aria-label="连接 Garden Light，信号较弱">
+                    <span class="device-symbol">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="m7 7 10 10-5 4V3l5 4L7 17"></path>
+                      </svg>
+                    </span>
+                    <span class="device-copy">
+                      <h3>Garden Light</h3>
+                      <p>YX-T01 · 约 6 米</p>
+                    </span>
+                    <span class="signal weak" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+                    <span class="connection-action">连接</span>
+                  </button>
+                </div>
+
+                <p class="privacy-note reveal">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="5" y="10" width="14" height="10" rx="3"></rect>
+                    <path d="M8.5 10V7.5a3.5 3.5 0 0 1 7 0V10"></path>
+                  </svg>
+                  仅使用蓝牙与附近设备通信，不会上传位置或设备信息。
+                </p>
+              </div>
+            </section>
+
+            <!-- 界面 2：定时任务总览 -->
+            <section class="screen" data-screen="1" aria-labelledby="overviewTitle">
+              <div class="screen-content">
+                <header class="topbar reveal">
+                  <div>
+                    <p class="eyebrow">我的设备</p>
+                    <h1 id="overviewTitle">定时任务</h1>
+                  </div>
+                  <div class="avatar" aria-label="设备已连接">PT</div>
+                </header>
+
+                <div class="connection-strip reveal">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <strong class="connected-device-name">Porch Timer</strong>
+                  <span>已同步</span>
+                </div>
+
+                <article class="next-task reveal" aria-labelledby="nextTaskHeading">
+                  <div class="next-label">下一个任务</div>
+                  <div class="next-layout">
+                    <div>
+                      <p class="countdown-number" id="nextCountdown">45</p>
+                      <p class="countdown-unit" id="nextCountdownUnit">分钟后</p>
+                    </div>
+                    <div class="action-orb" id="nextActionOrb">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M9 18h6"></path>
+                        <path d="M10 22h4"></path>
+                        <path d="M8.1 14.5A6 6 0 1 1 15.9 14.5C14.7 15.3 14 16.4 14 18h-4c0-1.6-.7-2.7-1.9-3.5Z"></path>
+                        <path d="M9.2 9.5h5.6"></path>
+                      </svg>
+                    </div>
+                  </div>
+                  <p class="next-description" id="nextTaskHeading">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M9 18h6"></path>
+                      <path d="M10 22h4"></path>
+                      <path d="M8.1 14.5A6 6 0 1 1 15.9 14.5C14.7 15.3 14 16.4 14 18h-4c0-1.6-.7-2.7-1.9-3.5Z"></path>
+                    </svg>
+                    <span id="nextActionText">关闭主灯 · 仅一次</span>
+                  </p>
+                </article>
+
+                <div class="task-heading reveal">
+                  <h2>全部任务</h2>
+                  <button type="button" id="toggleAllButton">全部暂停</button>
+                </div>
+
+                <div class="task-list card reveal" id="taskList" aria-live="polite"></div>
+              </div>
+
+              <button class="floating-add" type="button" id="addTaskButton">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14"></path>
+                </svg>
+                新建任务
+              </button>
+            </section>
+
+            <!-- 界面 3：设置定时任务 -->
+            <section class="screen" data-screen="2" aria-labelledby="editorTitle">
+              <div class="screen-content">
+                <header class="topbar editor-topbar reveal">
+                  <button class="back-button" type="button" id="backButton" aria-label="返回定时任务总览">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m15 5-7 7 7 7"></path>
+                    </svg>
+                  </button>
+                  <div class="editor-title">
+                    <h1 id="editorTitle">新建定时任务</h1>
+                  </div>
+                  <span class="topbar-spacer" aria-hidden="true"></span>
+                </header>
+
+                <div class="device-context card reveal">
+                  <span class="device-symbol">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m7 7 10 10-5 4V3l5 4L7 17"></path>
+                    </svg>
+                  </span>
+                  <span class="context-copy">
+                    <strong class="connected-device-name">Porch Timer</strong>
+                    <span>在线 · 设置将写入设备</span>
+                  </span>
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="color: var(--tertiary); width: 1rem;">
+                    <path d="m9 5 7 7-7 7"></path>
+                  </svg>
+                </div>
+
+                <p class="section-label reveal">执行动作</p>
+                <div class="action-segment reveal" role="radiogroup" aria-label="执行动作">
+                  <button class="action-option is-selected" type="button" role="radio" aria-checked="true" data-action="off">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M9 18h6"></path>
+                      <path d="M10 22h4"></path>
+                      <path d="M8.1 14.5A6 6 0 1 1 15.9 14.5C14.7 15.3 14 16.4 14 18h-4c0-1.6-.7-2.7-1.9-3.5Z"></path>
+                      <path d="M9.2 9.5h5.6"></path>
+                    </svg>
+                    关灯
+                  </button>
+                  <button class="action-option" type="button" role="radio" aria-checked="false" data-action="on">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M9 18h6"></path>
+                      <path d="M10 22h4"></path>
+                      <path d="M8.1 14.5A6 6 0 1 1 15.9 14.5C14.7 15.3 14 16.4 14 18h-4c0-1.6-.7-2.7-1.9-3.5Z"></path>
+                      <path d="M12 2V.5M4.8 4.8 3.7 3.7M19.2 4.8l1.1-1.1"></path>
+                    </svg>
+                    开灯
+                  </button>
+                </div>
+
+                <p class="section-label reveal">多久以后</p>
+                <div class="time-card card reveal" id="timeCard">
+                  <div class="picker" aria-label="选择倒计时时长">
+                    <div class="wheel-group">
+                      <ul class="wheel" id="hourWheel" aria-label="小时" tabindex="0"></ul>
+                      <span class="wheel-unit">小时</span>
+                    </div>
+                    <div class="wheel-group">
+                      <ul class="wheel" id="minuteWheel" aria-label="分钟" tabindex="0"></ul>
+                      <span class="wheel-unit">分钟</span>
+                    </div>
+                  </div>
+                  <div class="quick-options" aria-label="常用时长">
+                    <button class="quick-chip" type="button" data-hours="0" data-minutes="15">15 分钟</button>
+                    <button class="quick-chip is-selected" type="button" data-hours="0" data-minutes="45">45 分钟</button>
+                    <button class="quick-chip" type="button" data-hours="1" data-minutes="0">1 小时</button>
+                    <button class="quick-chip" type="button" data-hours="2" data-minutes="0">2 小时</button>
+                  </div>
+                </div>
+
+                <div class="execution-preview card reveal">
+                  <span class="preview-symbol">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9"></circle>
+                      <path d="M12 7v5l3 2"></path>
+                    </svg>
+                  </span>
+                  <span>
+                    <p>预计执行</p>
+                    <strong id="executionPreview">今天 22:26 · 关闭主灯</strong>
+                  </span>
+                </div>
+
+                <div class="setting-row card reveal">
+                  <span class="setting-icon">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path>
+                      <path d="M10 21h4"></path>
+                    </svg>
+                  </span>
+                  <span class="setting-copy">
+                    <strong>执行时通知我</strong>
+                    <span>设备完成任务后发送提醒</span>
+                  </span>
+                  <button class="switch" type="button" role="switch" aria-checked="true" id="notifySwitch" aria-label="执行时通知我"></button>
+                </div>
+
+                <div class="save-area reveal">
+                  <button class="primary-button" type="button" id="saveButton">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 3v12"></path>
+                      <path d="m7 10 5 5 5-5"></path>
+                      <path d="M5 20h14"></path>
+                    </svg>
+                    <span>保存并同步</span>
+                  </button>
+                  <p class="save-note">任务保存在设备中，手机断开蓝牙后仍会准时执行。</p>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div class="toast" id="toast" role="status" aria-live="polite">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m5 12 4 4L19 6"></path>
+          </svg>
+          <span id="toastText">操作成功</span>
+        </div>
+        <div class="home-indicator" aria-hidden="true"></div>
+      </div>
+    </section>
+
+    <!-- 桌面预览时显示，手机宽度下自动隐藏 -->
+    <nav class="prototype-nav" aria-label="样稿界面切换">
+      <button type="button" aria-current="page" data-jump="0">扫描设备</button>
+      <button type="button" data-jump="1">任务总览</button>
+      <button type="button" data-jump="2">设置任务</button>
+    </nav>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const viewport = document.getElementById("viewport");
+      const track = document.getElementById("screenTrack");
+      const screens = [...document.querySelectorAll(".screen")];
+      const navButtons = [...document.querySelectorAll("[data-jump]")];
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+      let activeScreen = 0;
+      let position = 0;
+      let velocity = 0;
+      let target = 0;
+      let animationFrame = 0;
+      let lastFrameTime = 0;
+      let connectedDevice = "Porch Timer";
+      let selectedAction = "off";
+      let selectedHours = 0;
+      let selectedMinutes = 45;
+      let editingTaskId = null;
+      let toastTimer = 0;
+      let scanTimer = 0;
+      let saveTimer = 0;
+
+      const tasks = [
+        { id: 1, action: "off", hours: 0, minutes: 45, enabled: true },
+        { id: 2, action: "on", hours: 8, minutes: 0, enabled: true }
+      ];
+
+      const bulbIcon = (action) => `
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 18h6"></path>
+          <path d="M10 22h4"></path>
+          <path d="M8.1 14.5A6 6 0 1 1 15.9 14.5C14.7 15.3 14 16.4 14 18h-4c0-1.6-.7-2.7-1.9-3.5Z"></path>
+          ${action === "off"
+            ? '<path d="M9.2 9.5h5.6"></path>'
+            : '<path d="M12 2V.5M4.8 4.8 3.7 3.7M19.2 4.8l1.1-1.1"></path>'}
+        </svg>`;
+
+      function updateStatusTime() {
+        const now = new Date();
+        document.getElementById("statusTime").textContent =
+          `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      }
+
+      // 使用临界阻尼弹簧切换界面；中途再次点击会从当前速度继续，而不会跳帧。
+      function springStep(time) {
+        if (!lastFrameTime) lastFrameTime = time;
+        const dt = Math.min((time - lastFrameTime) / 1000, 0.032);
+        lastFrameTime = time;
+
+        const omega = 15.5;
+        const dampingRatio = 1;
+        const acceleration =
+          -2 * dampingRatio * omega * velocity -
+          omega * omega * (position - target);
+
+        velocity += acceleration * dt;
+        position += velocity * dt;
+        track.style.transform = `translate3d(${position}px, 0, 0)`;
+
+        if (Math.abs(position - target) < 0.15 && Math.abs(velocity) < 0.15) {
+          position = target;
+          velocity = 0;
+          track.style.transform = `translate3d(${position}px, 0, 0)`;
+          animationFrame = 0;
+          lastFrameTime = 0;
+          return;
+        }
+
+        animationFrame = requestAnimationFrame(springStep);
+      }
+
+      function goToScreen(index, instant = false) {
+        const nextIndex = Math.max(0, Math.min(screens.length - 1, index));
+        activeScreen = nextIndex;
+        target = -nextIndex * viewport.clientWidth;
+
+        screens.forEach((screen, screenIndex) => {
+          screen.classList.toggle("is-active", screenIndex === nextIndex);
+          screen.setAttribute("aria-hidden", String(screenIndex !== nextIndex));
+          screen.inert = screenIndex !== nextIndex;
+        });
+
+        navButtons.forEach((button, buttonIndex) => {
+          if (buttonIndex === nextIndex) {
+            button.setAttribute("aria-current", "page");
+          } else {
+            button.removeAttribute("aria-current");
+          }
+        });
+
+        if (instant || reducedMotion.matches) {
+          if (animationFrame) cancelAnimationFrame(animationFrame);
+          animationFrame = 0;
+          lastFrameTime = 0;
+          position = target;
+          velocity = 0;
+          track.style.transform = `translate3d(${position}px, 0, 0)`;
+          return;
+        }
+
+        if (!animationFrame) {
+          lastFrameTime = 0;
+          animationFrame = requestAnimationFrame(springStep);
+        }
+      }
+
+      function showToast(message) {
+        const toast = document.getElementById("toast");
+        document.getElementById("toastText").textContent = message;
+        window.clearTimeout(toastTimer);
+        toast.classList.add("is-visible");
+        toastTimer = window.setTimeout(() => toast.classList.remove("is-visible"), 1900);
+      }
+
+      function formatDuration(hours, minutes, compact = false) {
+        if (hours === 0) return `${minutes}${compact ? " 分钟" : " 分钟后"}`;
+        if (minutes === 0) return `${hours}${compact ? " 小时" : " 小时后"}`;
+        return `${hours} 小时 ${minutes} 分钟${compact ? "" : "后"}`;
+      }
+
+      function getExecutionDate(hours, minutes) {
+        const result = new Date(Date.now() + (hours * 60 + minutes) * 60 * 1000);
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setDate(now.getDate() + 1);
+        const dayLabel =
+          result.toDateString() === now.toDateString()
+            ? "今天"
+            : result.toDateString() === tomorrow.toDateString()
+              ? "明天"
+              : `${result.getMonth() + 1}月${result.getDate()}日`;
+        const time = `${String(result.getHours()).padStart(2, "0")}:${String(result.getMinutes()).padStart(2, "0")}`;
+        return `${dayLabel} ${time}`;
+      }
+
+      function renderTasks() {
+        const list = document.getElementById("taskList");
+        list.innerHTML = "";
+
+        tasks.forEach((task) => {
+          const row = document.createElement("div");
+          row.className = "task-row";
+          row.innerHTML = `
+            <button class="task-main" type="button" data-edit="${task.id}" aria-label="编辑${task.action === "off" ? "关灯" : "开灯"}任务">
+              <span class="task-icon ${task.action}">
+                ${bulbIcon(task.action)}
+              </span>
+              <span class="task-copy">
+                <h3>${task.action === "off" ? "关闭主灯" : "开启主灯"}</h3>
+                <p>${formatDuration(task.hours, task.minutes)} · 仅一次</p>
+              </span>
+            </button>
+            <button class="switch" type="button" role="switch"
+              aria-checked="${task.enabled}"
+              aria-label="${task.enabled ? "暂停" : "启用"}${task.action === "off" ? "关灯" : "开灯"}任务"
+              data-toggle="${task.id}"></button>
+          `;
+          list.appendChild(row);
+        });
+
+        list.querySelectorAll("[data-edit]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const task = tasks.find((item) => item.id === Number(button.dataset.edit));
+            if (!task) return;
+            editingTaskId = task.id;
+            document.getElementById("editorTitle").textContent = "编辑定时任务";
+            setAction(task.action);
+            setDuration(task.hours, task.minutes);
+            goToScreen(2);
+          });
+        });
+
+        list.querySelectorAll("[data-toggle]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const task = tasks.find((item) => item.id === Number(button.dataset.toggle));
+            if (!task) return;
+            task.enabled = !task.enabled;
+            renderTasks();
+            updateNextTask();
+          });
+        });
+
+        const allPaused = tasks.every((task) => !task.enabled);
+        document.getElementById("toggleAllButton").textContent = allPaused ? "全部启用" : "全部暂停";
+      }
+
+      function updateNextTask() {
+        const task = tasks.find((item) => item.enabled);
+        const number = document.getElementById("nextCountdown");
+        const unit = document.getElementById("nextCountdownUnit");
+        const text = document.getElementById("nextActionText");
+        const orb = document.getElementById("nextActionOrb");
+
+        if (!task) {
+          number.textContent = "—";
+          unit.textContent = "暂无启用任务";
+          text.textContent = "新建或启用一个任务";
+          orb.innerHTML = bulbIcon("off");
+          return;
+        }
+
+        const totalMinutes = task.hours * 60 + task.minutes;
+        if (task.hours > 0 && task.minutes === 0) {
+          number.textContent = String(task.hours);
+          unit.textContent = "小时后";
+        } else if (task.hours > 0) {
+          number.textContent = `${task.hours}:${String(task.minutes).padStart(2, "0")}`;
+          unit.textContent = "小时 : 分钟后";
+        } else {
+          number.textContent = String(totalMinutes);
+          unit.textContent = "分钟后";
+        }
+        text.textContent =
+          `${task.action === "off" ? "关闭主灯" : "开启主灯"} · ${getExecutionDate(task.hours, task.minutes)}`;
+        orb.innerHTML = bulbIcon(task.action);
+      }
+
+      function renderWheel(element, values, selectedValue) {
+        element.innerHTML = values
+          .map((value) => `<li data-value="${value}">${String(value).padStart(2, "0")}</li>`)
+          .join("");
+        const selectedIndex = values.indexOf(selectedValue);
+        requestAnimationFrame(() => {
+          element.scrollTop = Math.max(0, selectedIndex) * 48.8;
+          updateWheelSelection(element, values, selectedIndex);
+        });
+      }
+
+      function updateWheelSelection(element, values, forcedIndex) {
+        const rowHeight = element.querySelector("li")?.offsetHeight || 48.8;
+        const index = forcedIndex ?? Math.max(0, Math.min(values.length - 1, Math.round(element.scrollTop / rowHeight)));
+        element.querySelectorAll("li").forEach((item, itemIndex) => {
+          item.classList.toggle("is-current", itemIndex === index);
+        });
+        return values[index];
+      }
+
+      const hourValues = Array.from({ length: 24 }, (_, index) => index);
+      const minuteValues = Array.from({ length: 12 }, (_, index) => index * 5);
+      const hourWheel = document.getElementById("hourWheel");
+      const minuteWheel = document.getElementById("minuteWheel");
+
+      function updateExecutionPreview() {
+        const actionLabel = selectedAction === "off" ? "关闭主灯" : "开启主灯";
+        document.getElementById("executionPreview").textContent =
+          `${getExecutionDate(selectedHours, selectedMinutes)} · ${actionLabel}`;
+
+        document.querySelectorAll(".quick-chip").forEach((chip) => {
+          const matches =
+            Number(chip.dataset.hours) === selectedHours &&
+            Number(chip.dataset.minutes) === selectedMinutes;
+          chip.classList.toggle("is-selected", matches);
+        });
+      }
+
+      function setDuration(hours, minutes) {
+        selectedHours = Math.max(0, Math.min(23, hours));
+        selectedMinutes = Math.max(0, Math.min(55, Math.round(minutes / 5) * 5));
+        renderWheel(hourWheel, hourValues, selectedHours);
+        renderWheel(minuteWheel, minuteValues, selectedMinutes);
+        updateExecutionPreview();
+      }
+
+      function setAction(action) {
+        selectedAction = action;
+        document.querySelectorAll(".action-option").forEach((option) => {
+          const selected = option.dataset.action === action;
+          option.classList.toggle("is-selected", selected);
+          option.setAttribute("aria-checked", String(selected));
+        });
+        updateExecutionPreview();
+      }
+
+      let wheelTimer = 0;
+      function handleWheelScroll(element, values, type) {
+        const value = updateWheelSelection(element, values);
+        if (type === "hour") selectedHours = value;
+        if (type === "minute") selectedMinutes = value;
+        updateExecutionPreview();
+
+        window.clearTimeout(wheelTimer);
+        wheelTimer = window.setTimeout(() => {
+          const rowHeight = element.querySelector("li")?.offsetHeight || 48.8;
+          element.scrollTo({
+            top: values.indexOf(value) * rowHeight,
+            behavior: reducedMotion.matches ? "auto" : "smooth"
+          });
+        }, 90);
+      }
+
+      navButtons.forEach((button) => {
+        button.addEventListener("click", () => goToScreen(Number(button.dataset.jump)));
+      });
+
+      document.getElementById("scanButton").addEventListener("click", () => {
+        const content = document.getElementById("scanContent");
+        const status = document.getElementById("scanStatus");
+        window.clearTimeout(scanTimer);
+        content.classList.add("is-scanning");
+        status.innerHTML = "<strong>正在扫描</strong> · 请靠近设备";
+        scanTimer = window.setTimeout(() => {
+          content.classList.remove("is-scanning");
+          status.innerHTML = "<strong>发现 2 台设备</strong> · 列表已更新";
+          showToast("扫描完成，发现 2 台设备");
+        }, 1100);
+      });
+
+      document.querySelectorAll(".device-card").forEach((card) => {
+        card.addEventListener("click", () => {
+          const action = card.querySelector(".connection-action");
+          connectedDevice = card.dataset.device;
+          document.querySelectorAll(".device-card").forEach((item) => {
+            item.disabled = true;
+          });
+          action.textContent = "连接中…";
+          card.style.borderColor = "rgba(22, 135, 248, 0.34)";
+
+          window.setTimeout(() => {
+            document.querySelectorAll(".connected-device-name").forEach((name) => {
+              name.textContent = connectedDevice;
+            });
+            document.querySelectorAll(".device-card").forEach((item) => {
+              item.disabled = false;
+            });
+            action.textContent = "已连接";
+            showToast(`已连接到 ${connectedDevice}`);
+            goToScreen(1);
+          }, 620);
+        });
+      });
+
+      document.getElementById("helpButton").addEventListener("click", () => {
+        showToast("请开启设备电源，并将手机靠近设备");
+      });
+
+      document.getElementById("addTaskButton").addEventListener("click", () => {
+        editingTaskId = null;
+        document.getElementById("editorTitle").textContent = "新建定时任务";
+        setAction("off");
+        setDuration(0, 45);
+        goToScreen(2);
+      });
+
+      document.getElementById("backButton").addEventListener("click", () => {
+        goToScreen(1);
+      });
+
+      document.querySelectorAll(".action-option").forEach((option) => {
+        option.addEventListener("click", () => setAction(option.dataset.action));
+      });
+
+      document.querySelectorAll(".quick-chip").forEach((chip) => {
+        chip.addEventListener("click", () => {
+          setDuration(Number(chip.dataset.hours), Number(chip.dataset.minutes));
+        });
+      });
+
+      hourWheel.addEventListener("scroll", () => handleWheelScroll(hourWheel, hourValues, "hour"), { passive: true });
+      minuteWheel.addEventListener("scroll", () => handleWheelScroll(minuteWheel, minuteValues, "minute"), { passive: true });
+
+      document.getElementById("notifySwitch").addEventListener("click", (event) => {
+        const button = event.currentTarget;
+        button.setAttribute("aria-checked", String(button.getAttribute("aria-checked") !== "true"));
+      });
+
+      document.getElementById("toggleAllButton").addEventListener("click", () => {
+        const shouldEnable = tasks.every((task) => !task.enabled);
+        tasks.forEach((task) => { task.enabled = shouldEnable; });
+        renderTasks();
+        updateNextTask();
+        showToast(shouldEnable ? "全部任务已启用" : "全部任务已暂停");
+      });
+
+      document.getElementById("saveButton").addEventListener("click", () => {
+        const totalMinutes = selectedHours * 60 + selectedMinutes;
+        const timeCard = document.getElementById("timeCard");
+        const saveButton = document.getElementById("saveButton");
+        const saveLabel = saveButton.querySelector("span");
+
+        if (totalMinutes <= 0) {
+          timeCard.classList.remove("shake");
+          void timeCard.offsetWidth;
+          timeCard.classList.add("shake");
+          showToast("请至少设置 5 分钟");
+          return;
+        }
+
+        window.clearTimeout(saveTimer);
+        saveButton.disabled = true;
+        saveLabel.textContent = "正在写入设备…";
+
+        saveTimer = window.setTimeout(() => {
+          if (editingTaskId) {
+            const task = tasks.find((item) => item.id === editingTaskId);
+            if (task) {
+              task.action = selectedAction;
+              task.hours = selectedHours;
+              task.minutes = selectedMinutes;
+              task.enabled = true;
+            }
+          } else {
+            tasks.unshift({
+              id: Date.now(),
+              action: selectedAction,
+              hours: selectedHours,
+              minutes: selectedMinutes,
+              enabled: true
+            });
+          }
+
+          renderTasks();
+          updateNextTask();
+          saveButton.disabled = false;
+          saveLabel.textContent = "保存并同步";
+          goToScreen(1);
+          showToast(`任务已保存到 ${connectedDevice}`);
+        }, 760);
+      });
+
+      window.addEventListener("resize", () => goToScreen(activeScreen, true));
+      reducedMotion.addEventListener?.("change", () => goToScreen(activeScreen, true));
+
+      updateStatusTime();
+      window.setInterval(updateStatusTime, 30000);
+      renderWheel(hourWheel, hourValues, selectedHours);
+      renderWheel(minuteWheel, minuteValues, selectedMinutes);
+      renderTasks();
+      updateNextTask();
+      updateExecutionPreview();
+      goToScreen(0, true);
+    })();
+  </script>
+</body>
+</html>

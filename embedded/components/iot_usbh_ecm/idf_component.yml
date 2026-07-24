@@ -1,0 +1,19 @@
+dependencies:
+  cmake_utilities: '*'
+  iot_eth:
+    public: true
+    version: '*'
+  iot_usbh_cdc:
+    public: true
+    version: 3.0.0
+  idf: '>=5.2'
+description: USB Host ETH ECM Driver
+documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/usb/usb_host/usb_ecm.html
+issues: https://github.com/espressif/esp-iot-solution/issues
+repository: git://github.com/espressif/esp-iot-solution.git
+targets:
+- esp32s2
+- esp32s3
+- esp32p4
+url: https://github.com/espressif/esp-iot-solution
+version: 0.2.1

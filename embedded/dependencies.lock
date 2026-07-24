@@ -1,0 +1,54 @@
+dependencies:
+  espressif/cmake_utilities:
+    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.1
+  espressif/iot_eth:
+    component_hash: 2375af94aa38438e1411a8158ceda74e89170aa5b5b502371acdef4151be2a05
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.3
+  iot_usbh_cdc:
+    dependencies: []
+    source:
+      path: D:\codex\yx-gateway-1\embedded\components\iot_usbh_cdc
+      type: local
+    version: 3.0.0
+  joltwallet/littlefs:
+    component_hash: 01faa388c6305fe77fd6962cda6171e753033458f24f8fae9e9d932e3d817a4c
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.22.1
+direct_dependencies:
+- espressif/cmake_utilities
+- espressif/iot_eth
+- espressif/iot_usbh_cdc
+- idf
+- joltwallet/littlefs
+manifest_hash: 8d30f9acb770d6556d2c7017f820bdbb02117e07715868edfb1b91c9d60cedb8
+target: esp32s3
+version: 2.0.0

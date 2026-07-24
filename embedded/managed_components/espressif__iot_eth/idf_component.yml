@@ -1,0 +1,12 @@
+dependencies:
+  cmake_utilities: '*'
+  idf: '>=4.4'
+description: Ethernet interface driver for cellular modems and USB-to-Ethernet adapters
+documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/solution/4g/iot_eth.html
+issues: https://github.com/espressif/esp-iot-solution/issues
+repository: git://github.com/espressif/esp-iot-solution.git
+repository_info:
+  commit_sha: 7c133a8b81c161635ee1f093acd180a2322adb72
+  path: components/iot_eth
+url: https://github.com/espressif/esp-iot-solution/tree/master/components/iot_eth
+version: 1.0.0
