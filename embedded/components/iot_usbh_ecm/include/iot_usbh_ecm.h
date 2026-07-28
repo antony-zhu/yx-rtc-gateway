@@ -45,6 +45,21 @@ esp_err_t iot_eth_new_usb_ecm(const iot_usbh_ecm_config_t *config, iot_eth_drive
  */
 usbh_cdc_port_handle_t usb_ecm_get_cdc_port_handle(const iot_eth_driver_t *ecm_drv);
 
+/**
+ * @brief 获取最近一次 ECM USB 连接阶段的结果。
+ *
+ * @param[in] ecm_drv ECM 以太网驱动句柄。
+ *
+ * @return
+ *     - ESP_OK：ECM 接口及 CDC 端口已成功打开。
+ *     - ESP_ERR_NOT_FOUND：当前 USB 配置描述符中没有 ECM 接口。
+ *     - 其他错误：解析描述符或打开 CDC 端口失败。
+ *
+ * @note 该结果用于区分“模组未以 ECM 模式枚举”和主机侧内存/端点申请失败；
+ *       只读，不改变驱动或 USB 状态。
+ */
+esp_err_t usb_ecm_get_last_connect_error(const iot_eth_driver_t *ecm_drv);
+
 #ifdef __cplusplus
 }
 #endif

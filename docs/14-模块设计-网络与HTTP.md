@@ -99,6 +99,8 @@ main/
 | USB 等待超时 | 30 秒 | 等待 CDC/ECM 枚举 |
 | IP 等待超时 | 45 秒 | 等待 ECM 获取 IP |
 | 上电脉冲 | 3 秒 | `POWER_EN` 高电平保持时间 |
+| 断电释放 | 5 秒 | 断电后等待模组和 USB 端点完全离线 |
+| 复位脉冲 | 200 毫秒 | 连续恢复失败后驱动硬件 RESET |
 | 复位等待 | 5 秒 | 模组复位后的稳定等待时间 |
 
 配置存储规则：
@@ -164,6 +166,8 @@ gw_net_start(profile=4g)
   -> 安装 CDC + ECM 组件
   -> 上电或唤醒 4G 模组
   -> 等待 USB CDC/ECM 枚举
+  -> 若只有 AT 接口：发送 AT+MDIALUPCFG="mode",1
+  -> 软重启模组并等待 USB 断开、重新枚举出 ECM 接口
   -> 通过 AT 读取 IMEI、ICCID、SIM 状态
   -> 设置 APN
   -> 注册运营商网络
@@ -182,14 +186,36 @@ USB ECM 落地约束：
 6. 4G 启动阶段 AT 通道由系统独占，脚本不能直接占用 AT 通道。
 7. 4G ready 后，系统缓存模组基础信息；脚本只能通过受控 API 查询缓存或发起允许的业务查询。
 8. USB 断开、ECM lost IP 或 AT 通道关闭必须转换为 `NET_LOST` 或 `NET_FAILED`，不得直接重启设备。
+9. 每轮启动失败必须依次停止 ECM、切断模组电源、等待 5 秒，并完整销毁
+   netif glue、ECM driver、CDC client 和 USB Host；下一轮不得复用旧 USB 设备对象。
+10. 完整重建后仍连续失败两轮时，下一轮上电后对模组执行一次硬件 RESET
+    脉冲。恢复只重置 4G 子系统，不重启网关，RTC 调度和灯控任务不得受影响。
+11. CDC task 保持 12 KiB 片内栈，并在 BLE 初始化完成后、文件系统和业务任务
+    创建前预留；不得通过缩小任务栈掩盖连续片内块不足。
+12. CPU 复位后必须先执行一次 5 秒断电基线，再启动 USB Host 和模组；不能假定
+    CPU 复位会同步清除仍带电的 4G 模组或上一代 USB 端点。
+13. CDC 收发 ring buffer 不参与 DMA，固定放入 PSRAM；endpoint、URB transfer
+    buffer 和任务 TCB 所需的片内/DMA 内存不得被大 ring buffer 挤占。
+14. 若 USB 配置只有 AT 接口而没有 ECM 接口，必须通过 AT 写入
+    `AT+MDIALUPCFG="mode",1`，优先执行 `AT+CFUN=1,1`，5 秒内未发生真实 USB
+    断开时改用 `AT+MREBOOT=0`；最长等待 35 秒重新枚举，并以 ECM 接口成功打开
+    作为恢复成功判据，不能只依据 AT 命令返回 `OK`。
+15. CDC 打开端口时必须先声明 endpoint、完成内部 DMA QTD 分配，再创建普通 USB
+    transfer；AT 单次 transfer 固定为 1 KiB，容量排队由 PSRAM ring buffer 承担。
+16. 通用堆分配大于 4 KiB 时优先使用 PSRAM，并为内部/DMA 内存保留 64 KiB；
+    该配置用于避免内存碎片，不允许用缩小 12 KiB CDC task 栈替代。
+17. `DEV_GONE` 只能先标记链路断开，CDC/ECM 端口句柄由同步 closed 回调统一
+    清除；销毁任务必须等待端口关闭完成后才能释放 callback `user_data`。重启类
+    AT 命令只发送、不等待响应，避免模组移除端点时读线程访问已释放端口。
 
 异常处理：
 
 | 异常 | 处理 |
 | --- | --- |
 | 模组无响应 | 记录错误，尝试复位模组，进入退避重试 |
-| USB Host 安装失败 | 当前一轮联网失败，释放已创建对象后退避重试 |
-| CDC/ECM 枚举失败 | 当前一轮联网失败，必要时断电重上电后退避重试 |
+| USB Host 安装失败 | 当前一轮联网失败，完整释放 Host、CDC、ECM 对象后退避重试 |
+| 只有 AT 接口、没有 ECM | AT 写入 ECM 模式并软重启，等待 USB 重新枚举 |
+| CDC/ECM 枚举失败 | AT 不可用时断电 5 秒并完整重建 USB 栈；连续两轮失败后增加硬件复位 |
 | SIM 不存在 | 上报 `network_status=disconnected`，低频重试 |
 | APN 错误 | 上报失败原因，等待参数更新或下一轮重试 |
 | 注册网络失败 | 退避重试 |

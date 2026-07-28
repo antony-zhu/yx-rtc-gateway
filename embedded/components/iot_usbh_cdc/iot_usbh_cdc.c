@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "freertos/event_groups.h"
+#include "esp_heap_caps.h"
 #include "esp_private/usb_phy.h"
 #include "iot_usbh_cdc.h"
 #include "usb/usb_host.h"
@@ -36,6 +37,7 @@ static portMUX_TYPE cdc_lock =  portMUX_INITIALIZER_UNLOCKED;
 
 #define TIMEOUT_USB_RINGBUF_MS  200                      /*! Timeout for ring buffer operate */
 #define CDC_CTRL_TIMEOUT_MS     5000                     /*! Timeout for control transfer */
+#define CDC_TEARDOWN_TIMEOUT_MS 3000                     /*! CDC task 有界退出等待 */
 
 typedef struct dev_event_cb_s {
     usbh_cdc_device_event_callback_t cb;
@@ -48,6 +50,7 @@ typedef struct {
     usb_host_client_handle_t cdc_client_hdl;             /*!< USB Host handle reused for all CDC-ACM devices in the system */
     EventGroupHandle_t event_group;
     SemaphoreHandle_t open_close_mutex;
+    SemaphoreHandle_t dev_event_mutex;
     SLIST_HEAD(list_cb, dev_event_cb_s) dev_event_cb_list;
     SLIST_HEAD(list_dev_port, usbh_cdc_port_s) cdc_devices_port_list;   /*!< List of opened ports */
     SLIST_HEAD(list_dev, usbh_cdc_dev_s) cdc_devices_list;   /*!< List of opened devices */
@@ -144,6 +147,33 @@ static esp_err_t _cdc_dev_ctrl_free(usbh_cdc_dev_t *cdc_dev);
 static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer);
 
 /*--------------------------------- CDC Buffer Handle Code [RINGBUF_TYPE_BYTEBUF] --------------------------------------*/
+static RingbufHandle_t _cdc_ringbuf_create(size_t size)
+{
+#if CONFIG_SPIRAM
+    /*
+     * Ring buffer 不参与 USB DMA，放到 PSRAM，为 endpoint 和 transfer 保留片内
+     * DMA 连续块。CDC task 在普通任务上下文访问它，不要求 cache-off 可用。
+     */
+    return xRingbufferCreateWithCaps(size,
+                                     RINGBUF_TYPE_BYTEBUF,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    return xRingbufferCreate(size, RINGBUF_TYPE_BYTEBUF);
+#endif
+}
+
+static void _cdc_ringbuf_delete(RingbufHandle_t handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+#if CONFIG_SPIRAM
+    vRingbufferDeleteWithCaps(handle);
+#else
+    vRingbufferDelete(handle);
+#endif
+}
+
 static size_t _get_ringbuf_len(RingbufHandle_t ringbuf_hdl)
 {
     size_t uxItemsWaiting = 0;
@@ -317,6 +347,48 @@ static bool is_port_opened(usbh_cdc_port_t *cdc_port)
     return false;
 }
 
+/**
+ * @brief 锁定一个仍处于打开状态的 CDC 端口，防止 I/O 期间被 DEV_GONE 释放。
+ *
+ * 调用者必须通过 _cdc_port_io_unlock() 释放返回的 owner。这里复用端口开关锁，
+ * 让“校验端口仍在链表”和“访问 ring buffer”成为同一临界区，消除断开回调在
+ * 校验后立即释放端口造成的 UAF。当前 AT/ECM 读写均为短操作，不会长期占锁。
+ */
+static esp_err_t _cdc_port_io_lock(usbh_cdc_port_handle_t port_handle,
+                                   usbh_cdc_obj_t **owner_out,
+                                   usbh_cdc_port_t **port_out)
+{
+    usbh_cdc_obj_t *owner = p_usbh_cdc_obj;
+    usbh_cdc_port_t *port = (usbh_cdc_port_t *)port_handle;
+
+    ESP_RETURN_ON_FALSE(owner != NULL && owner->open_close_mutex != NULL,
+                        ESP_ERR_INVALID_STATE,
+                        TAG,
+                        "usb cdc is not installed");
+    ESP_RETURN_ON_FALSE(port != NULL && owner_out != NULL && port_out != NULL,
+                        ESP_ERR_INVALID_ARG,
+                        TAG,
+                        "cdc port lock argument is invalid");
+
+    xSemaphoreTake(owner->open_close_mutex, portMAX_DELAY);
+    if (!is_port_opened(port) || port->to_close) {
+        xSemaphoreGive(owner->open_close_mutex);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *owner_out = owner;
+    *port_out = port;
+    return ESP_OK;
+}
+
+/** @brief 释放 _cdc_port_io_lock() 持有的端口生命周期锁。 */
+static void _cdc_port_io_unlock(usbh_cdc_obj_t *owner)
+{
+    if (owner != NULL && owner->open_close_mutex != NULL) {
+        xSemaphoreGive(owner->open_close_mutex);
+    }
+}
+
 static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
 {
     switch (event_msg->event) {
@@ -343,6 +415,11 @@ static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg
 
         _cdc_fix_4g_bulk_ep_mps(device_desc, config_desc);
 
+        /*
+         * 注册/注销可由网络恢复任务发起，而设备事件运行在 CDC client task。
+         * 独立互斥锁保证遍历期间 callback 节点不会被另一任务释放。
+         */
+        xSemaphoreTake(p_usbh_cdc_obj->dev_event_mutex, portMAX_DELAY);
         dev_event_cb_t *evt_cb = NULL;
         SLIST_FOREACH(evt_cb, &p_usbh_cdc_obj->dev_event_cb_list, list_entry) {
             int match_intf = -1;
@@ -358,6 +435,7 @@ static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg
                 }
             }
         }
+        xSemaphoreGive(p_usbh_cdc_obj->dev_event_mutex);
         break;
     }
     case USB_HOST_CLIENT_EVENT_DEV_GONE: {
@@ -365,6 +443,7 @@ static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg
         ESP_ERROR_CHECK_WITHOUT_ABORT(usb_host_device_info(event_msg->dev_gone.dev_hdl, &device_info));
         ESP_LOGW(TAG, "Device %d suddenly disconnected", device_info.dev_addr);
 
+        xSemaphoreTake(p_usbh_cdc_obj->dev_event_mutex, portMAX_DELAY);
         dev_event_cb_t *evt_cb = NULL;
         SLIST_FOREACH(evt_cb, &p_usbh_cdc_obj->dev_event_cb_list, list_entry) {
             if (evt_cb->cb) {
@@ -375,14 +454,33 @@ static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg
                 evt_cb->cb(CDC_HOST_DEVICE_EVENT_DISCONNECTED, &evt_data, evt_cb->user_data);
             }
         }
+        xSemaphoreGive(p_usbh_cdc_obj->dev_event_mutex);
 
-        usbh_cdc_port_t *current, *tmp;
-        SLIST_FOREACH_SAFE(current, &(p_usbh_cdc_obj->cdc_devices_port_list), list_entry, tmp) {
-            if (current->cdc_dev->dev_hdl != event_msg->dev_gone.dev_hdl) {
-                continue; // skip non-matching devices
+        /*
+         * supervisor 可能同时主动关闭端口，不能在无锁状态遍历并解引用链表节点。
+         * 每次只在 open_close_mutex 内取得一个候选句柄，真正关闭仍由公共接口
+         * 二次校验；候选已被另一任务关闭时会安全返回并继续扫描。
+         */
+        while (true) {
+            usbh_cdc_port_t *candidate = NULL;
+            usbh_cdc_port_t *current = NULL;
+
+            xSemaphoreTake(p_usbh_cdc_obj->open_close_mutex, portMAX_DELAY);
+            SLIST_FOREACH(current,
+                          &(p_usbh_cdc_obj->cdc_devices_port_list),
+                          list_entry) {
+                if (current->cdc_dev->dev_hdl == event_msg->dev_gone.dev_hdl) {
+                    candidate = current;
+                    break;
+                }
             }
-            // Close the port if the device is gone
-            ESP_ERROR_CHECK_WITHOUT_ABORT(usbh_cdc_port_close((usbh_cdc_port_handle_t)current));
+            xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
+
+            if (candidate == NULL) {
+                break;
+            }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                usbh_cdc_port_close((usbh_cdc_port_handle_t)candidate));
         }
         break;
     }
@@ -416,12 +514,45 @@ esp_err_t usbh_cdc_driver_install(const usbh_cdc_driver_config_t *config)
     ESP_RETURN_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_NO_MEM, TAG, "calloc failed");
     EventGroupHandle_t event_group = xEventGroupCreate();
     SemaphoreHandle_t cdc_mutex = xSemaphoreCreateMutex();
+    SemaphoreHandle_t dev_event_mutex = xSemaphoreCreateMutex();
     TaskHandle_t driver_task_h = NULL;
     bool client_registered = false;
 
+    ESP_LOGI(TAG,
+             "install resources: stack=%u internal_free=%u internal_largest=%u "
+             "spiram_free=%u",
+             (unsigned)config->task_stack_size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                        MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
     BaseType_t core_id = (config->task_coreid < 0) ? tskNO_AFFINITY : config->task_coreid;
-    xTaskCreatePinnedToCore(usbh_cdc_client_task, "usbh_cdc", config->task_stack_size, NULL, config->task_priority, &driver_task_h, core_id);
-    if (p_usbh_cdc_obj == NULL || driver_task_h == NULL || event_group == NULL || cdc_mutex == NULL) {
+    BaseType_t task_created = xTaskCreatePinnedToCore(usbh_cdc_client_task,
+                                                     "usbh_cdc",
+                                                     config->task_stack_size,
+                                                     NULL,
+                                                     config->task_priority,
+                                                     &driver_task_h,
+                                                     core_id);
+    if (task_created != pdPASS ||
+        driver_task_h == NULL ||
+        event_group == NULL ||
+        cdc_mutex == NULL ||
+        dev_event_mutex == NULL) {
+        ESP_LOGE(TAG,
+                 "install allocation failed: task_result=%ld task=%p event=%p "
+                 "port_mutex=%p event_mutex=%p "
+                 "internal_free=%u internal_largest=%u spiram_free=%u",
+                 (long)task_created,
+                 driver_task_h,
+                 event_group,
+                 cdc_mutex,
+                 dev_event_mutex,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                            MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         ret = ESP_ERR_NO_MEM;
         goto err;
     }
@@ -444,6 +575,7 @@ esp_err_t usbh_cdc_driver_install(const usbh_cdc_driver_config_t *config)
     p_usbh_cdc_obj->cdc_client_hdl = usb_client;
     p_usbh_cdc_obj->event_group = event_group;
     p_usbh_cdc_obj->open_close_mutex = cdc_mutex;
+    p_usbh_cdc_obj->dev_event_mutex = dev_event_mutex;
 
     xTaskNotifyGive(driver_task_h);
     return ESP_OK;
@@ -453,7 +585,13 @@ err: // Clean-up
         ESP_ERROR_CHECK(usb_host_client_deregister(usb_client));
     }
     if (p_usbh_cdc_obj) {
-        free(p_usbh_cdc_obj);
+        /*
+         * 创建任务或同步对象失败时必须先清空全局句柄。旧实现释放后保留悬空
+         * 指针，下一次安装会误报“已安装”，随后注册回调时破坏堆并触发 panic。
+         */
+        usbh_cdc_obj_t *failed_obj = p_usbh_cdc_obj;
+        p_usbh_cdc_obj = NULL;
+        free(failed_obj);
     }
     if (event_group) {
         vEventGroupDelete(event_group);
@@ -463,6 +601,9 @@ err: // Clean-up
     }
     if (cdc_mutex) {
         vSemaphoreDelete(cdc_mutex);
+    }
+    if (dev_event_mutex) {
+        vSemaphoreDelete(dev_event_mutex);
     }
     return ret;
 }
@@ -483,22 +624,38 @@ esp_err_t usbh_cdc_driver_uninstall(void)
     }
     CDC_EXIT_CRITICAL();
 
+    xSemaphoreTake(p_usbh_cdc_obj->dev_event_mutex, portMAX_DELAY);
     dev_event_cb_t *current, *tmp;
     SLIST_FOREACH_SAFE(current, &p_usbh_cdc_obj->dev_event_cb_list, list_entry, tmp) {
         SLIST_REMOVE(&(p_usbh_cdc_obj->dev_event_cb_list), current, dev_event_cb_s, list_entry);
         free(current);
     }
+    xSemaphoreGive(p_usbh_cdc_obj->dev_event_mutex);
 
-    // Signal to CDC task to stop, unblock it and wait for its deletion
+    /*
+     * CDC client task 异常时不能永久卡住网络恢复。超时保留对象和句柄供下一轮
+     * 重试，绝不在任务仍可能访问它们时提前 free。
+     */
     xEventGroupSetBits(p_usbh_cdc_obj->event_group, CDC_TEARDOWN);
     usb_host_client_unblock(p_usbh_cdc_obj->cdc_client_hdl);
-    ESP_GOTO_ON_FALSE(
-        xEventGroupWaitBits(p_usbh_cdc_obj->event_group, CDC_TEARDOWN_COMPLETE, pdTRUE, pdFALSE, portMAX_DELAY),
-        ESP_ERR_NOT_FINISHED, unblock, TAG, "Wait for CDC_TEARDOWN_COMPLETE failed");
+    EventBits_t teardown_bits =
+        xEventGroupWaitBits(p_usbh_cdc_obj->event_group,
+                            CDC_TEARDOWN_COMPLETE,
+                            pdFALSE,
+                            pdFALSE,
+                            pdMS_TO_TICKS(CDC_TEARDOWN_TIMEOUT_MS));
+    ESP_GOTO_ON_FALSE((teardown_bits & CDC_TEARDOWN_COMPLETE) != 0U,
+                      ESP_ERR_TIMEOUT,
+                      unblock,
+                      TAG,
+                      "Wait for CDC_TEARDOWN_COMPLETE timed out");
+
+    ret = usb_host_client_deregister(p_usbh_cdc_obj->cdc_client_hdl);
+    ESP_GOTO_ON_ERROR(ret, unblock, TAG, "Failed to deregister USB Host client");
+
     vEventGroupDelete(p_usbh_cdc_obj->event_group);
     vSemaphoreDelete(p_usbh_cdc_obj->open_close_mutex);
-    ESP_ERROR_CHECK(usb_host_client_deregister(p_usbh_cdc_obj->cdc_client_hdl));
-
+    vSemaphoreDelete(p_usbh_cdc_obj->dev_event_mutex);
     free(p_usbh_cdc_obj);
     p_usbh_cdc_obj = NULL;
 
@@ -513,10 +670,13 @@ esp_err_t usbh_cdc_register_dev_event_cb(const usb_device_match_id_t *dev_match_
     ESP_RETURN_ON_FALSE(event_cb, ESP_ERR_INVALID_ARG, TAG, "event_cb is NULL");
 
     dev_event_cb_t *cb = (dev_event_cb_t *) calloc(1, sizeof(dev_event_cb_t));
+    ESP_RETURN_ON_FALSE(cb != NULL, ESP_ERR_NO_MEM, TAG, "calloc failed for device event callback");
     cb->cb = event_cb;
     cb->user_data = user_data;
     cb->match_id_list = dev_match_id_list;
+    xSemaphoreTake(p_usbh_cdc_obj->dev_event_mutex, portMAX_DELAY);
     SLIST_INSERT_HEAD(&(p_usbh_cdc_obj->dev_event_cb_list), cb, list_entry);
+    xSemaphoreGive(p_usbh_cdc_obj->dev_event_mutex);
     return ESP_OK;
 }
 
@@ -525,15 +685,19 @@ esp_err_t usbh_cdc_unregister_dev_event_cb(usbh_cdc_device_event_callback_t even
     ESP_RETURN_ON_FALSE(p_usbh_cdc_obj, ESP_ERR_INVALID_STATE, TAG, "usbh cdc not installed");
     ESP_RETURN_ON_FALSE(event_cb, ESP_ERR_INVALID_ARG, TAG, "event_cb is NULL");
     // remove the new_dev_cb from the list
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    xSemaphoreTake(p_usbh_cdc_obj->dev_event_mutex, portMAX_DELAY);
     dev_event_cb_t *current, *tmp;
     SLIST_FOREACH_SAFE(current, &p_usbh_cdc_obj->dev_event_cb_list, list_entry, tmp) {
         if (current->cb == event_cb) {
             SLIST_REMOVE(&(p_usbh_cdc_obj->dev_event_cb_list), current, dev_event_cb_s, list_entry);
             free(current);
-            return ESP_OK;
+            ret = ESP_OK;
+            break;
         }
     }
-    return ESP_ERR_NOT_FOUND;
+    xSemaphoreGive(p_usbh_cdc_obj->dev_event_mutex);
+    return ret;
 }
 
 static esp_err_t _cdc_reset_transfer_endpoint(usb_device_handle_t dev_hdl, usb_transfer_t *transfer)
@@ -659,6 +823,11 @@ static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer)
 {
     usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) out_xfer->context;
 
+    if (cdc_port->to_close) {
+        xSemaphoreGive(cdc_port->data.out_xfer_free_sem);
+        return;
+    }
+
     if (cdc_port->out_ringbuf_handle) {
         size_t data_len = _get_ringbuf_len(cdc_port->out_ringbuf_handle);
         if (data_len > 0) {
@@ -679,17 +848,26 @@ static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer)
 
 static esp_err_t _cdc_dev_ctrl_free(usbh_cdc_dev_t *cdc_dev)
 {
-    if (cdc_dev->ctrl.xfer) {
-        xSemaphoreTake(cdc_dev->ctrl.mux, portMAX_DELAY);
+    ESP_RETURN_ON_FALSE(cdc_dev != NULL, ESP_ERR_INVALID_ARG, TAG, "cdc_dev is NULL");
 
-        if (cdc_dev->ctrl.xfer->context) {
-            vSemaphoreDelete(cdc_dev->ctrl.xfer->context);
-        }
-        if (cdc_dev->ctrl.mux) {
-            vSemaphoreDelete(cdc_dev->ctrl.mux);
+    SemaphoreHandle_t ctrl_mux = cdc_dev->ctrl.mux;
+    if (ctrl_mux != NULL) {
+        xSemaphoreTake(ctrl_mux, portMAX_DELAY);
+    }
+
+    if (cdc_dev->ctrl.xfer != NULL) {
+        if (cdc_dev->ctrl.xfer->context != NULL) {
+            vSemaphoreDelete((SemaphoreHandle_t)cdc_dev->ctrl.xfer->context);
+            cdc_dev->ctrl.xfer->context = NULL;
         }
         usb_host_transfer_free(cdc_dev->ctrl.xfer);
         cdc_dev->ctrl.xfer = NULL;
+    }
+
+    if (ctrl_mux != NULL) {
+        xSemaphoreGive(ctrl_mux);
+        vSemaphoreDelete(ctrl_mux);
+        cdc_dev->ctrl.mux = NULL;
     }
     return ESP_OK;
 }
@@ -757,6 +935,16 @@ static esp_err_t _cdc_transfers_allocate(usbh_cdc_port_t *cdc_port, const usb_ep
     }
     return ret;
 err:
+    ESP_LOGE(TAG,
+             "transfer allocation state: internal_free=%u internal_largest=%u "
+             "dma_free=%u dma_largest=%u spiram_free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                        MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                        MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     _cdc_transfers_free(cdc_port);
     return ret;
 }
@@ -767,12 +955,16 @@ static void _cdc_transfers_free(usbh_cdc_port_t *cdc_port)
 
     if (cdc_port->notif.xfer) {
         usb_host_transfer_free(cdc_port->notif.xfer);
+        cdc_port->notif.xfer = NULL;
     }
     if (cdc_port->data.in_xfer) {
         usb_host_transfer_free(cdc_port->data.in_xfer);
+        cdc_port->data.in_xfer = NULL;
+        cdc_port->data.in_data_buffer_base = NULL;
     }
     if (cdc_port->data.out_xfer) {
         usb_host_transfer_free(cdc_port->data.out_xfer);
+        cdc_port->data.out_xfer = NULL;
     }
 }
 
@@ -804,21 +996,31 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
     ESP_GOTO_ON_FALSE(cdc_port != NULL, ESP_ERR_NO_MEM, err_exit, TAG, "calloc failed for cdc port");
 
     bool is_claimed_data = false, is_claimed_notif = false;
+    bool new_dev_inserted = false;
+    usb_device_handle_t newly_opened_device = NULL;
     // If the device handle is not set, try to open the device
     usbh_cdc_dev_t *_cdc_dev = get_cdc_dev_by_addr(port_config->dev_addr);
     usbh_cdc_dev_t *new_cdc_dev = NULL;
     if (NULL == _cdc_dev) {
-        usb_device_handle_t current_device = NULL;
-        ESP_GOTO_ON_ERROR(usb_host_device_open(p_usbh_cdc_obj->cdc_client_hdl, port_config->dev_addr, &current_device), err, TAG, "Could not open device %d", port_config->dev_addr);
+        ESP_GOTO_ON_ERROR(
+            usb_host_device_open(p_usbh_cdc_obj->cdc_client_hdl,
+                                 port_config->dev_addr,
+                                 &newly_opened_device),
+            err,
+            TAG,
+            "Could not open device %d",
+            port_config->dev_addr);
 
         new_cdc_dev = (usbh_cdc_dev_t *)calloc(1, sizeof(usbh_cdc_dev_t));
         ESP_GOTO_ON_FALSE(new_cdc_dev != NULL, ESP_ERR_NO_MEM, err, TAG, "calloc failed for cdc device");
         new_cdc_dev->dev_addr = port_config->dev_addr;
-        new_cdc_dev->dev_hdl = current_device;
+        new_cdc_dev->dev_hdl = newly_opened_device;
+        newly_opened_device = NULL;
         ESP_GOTO_ON_ERROR(_cdc_dev_ctrl_allocate(new_cdc_dev), err, TAG, "Failed to allocate ctrl");
         CDC_ENTER_CRITICAL();
         SLIST_INSERT_HEAD(&p_usbh_cdc_obj->cdc_devices_list, new_cdc_dev, list_entry);
         CDC_EXIT_CRITICAL();
+        new_dev_inserted = true;
         _cdc_dev = new_cdc_dev;
     }
     cdc_port->cdc_dev = _cdc_dev;
@@ -837,12 +1039,12 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
     cdc_port->itf_num = port_config->itf_num;
 
     if (cdc_port->in_ringbuf_size != 0) {
-        cdc_port->in_ringbuf_handle = xRingbufferCreate(cdc_port->in_ringbuf_size, RINGBUF_TYPE_BYTEBUF);
+        cdc_port->in_ringbuf_handle = _cdc_ringbuf_create(cdc_port->in_ringbuf_size);
         ESP_GOTO_ON_FALSE(cdc_port->in_ringbuf_handle != NULL, ESP_ERR_NO_MEM, err, TAG, "Failed to create ring buffer");
     }
 
     if (cdc_port->out_ringbuf_size != 0) {
-        cdc_port->out_ringbuf_handle = xRingbufferCreate(cdc_port->out_ringbuf_size, RINGBUF_TYPE_BYTEBUF);
+        cdc_port->out_ringbuf_handle = _cdc_ringbuf_create(cdc_port->out_ringbuf_size);
         ESP_GOTO_ON_FALSE(cdc_port->out_ringbuf_handle != NULL, ESP_ERR_NO_MEM, err, TAG, "Failed to create ring buffer");
     }
 
@@ -871,10 +1073,11 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
         _ringbuf_flush(cdc_port->out_ringbuf_handle);
     }
 
-    ESP_GOTO_ON_ERROR(_cdc_transfers_allocate(cdc_port, cdc_info.notif_ep, cdc_info.in_ep, cdc_info.out_ep,
-                                              port_config->in_transfer_buffer_size, port_config->out_transfer_buffer_size), err, TAG, "Failed to allocate transfers");
-
-    // Claim the interface
+    /*
+     * HCD endpoint 的双 QTD 描述符必须来自 512 字节对齐的片内 DMA 内存。
+     * 先 claim endpoint，再申请较大的 transfer data buffer，避免后者先切碎
+     * DMA heap，造成总 RAM 充足却在 endpoint claim 阶段报 ESP_ERR_NO_MEM。
+     */
     ESP_GOTO_ON_ERROR(
         usb_host_interface_claim(
             p_usbh_cdc_obj->cdc_client_hdl,
@@ -883,7 +1086,7 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
             cdc_port->data.intf_desc->bAlternateSetting),
         err, TAG, "Could not claim interface");
     is_claimed_data = true;
-    if (cdc_port->notif.xfer) {
+    if (cdc_info.notif_ep != NULL) {
         // If notification are supported, claim its interface and start polling its IN endpoint
         if (cdc_port->notif.intf_desc != cdc_port->data.intf_desc) {
             ESP_GOTO_ON_ERROR(
@@ -896,6 +1099,17 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
             is_claimed_notif = true;
         }
     }
+
+    ESP_GOTO_ON_ERROR(
+        _cdc_transfers_allocate(cdc_port,
+                                cdc_info.notif_ep,
+                                cdc_info.in_ep,
+                                cdc_info.out_ep,
+                                port_config->in_transfer_buffer_size,
+                                port_config->out_transfer_buffer_size),
+        err,
+        TAG,
+        "Failed to allocate transfers");
 
     CDC_ENTER_CRITICAL();
     SLIST_INSERT_HEAD(&(p_usbh_cdc_obj->cdc_devices_port_list), cdc_port, list_entry);
@@ -917,6 +1131,20 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
     return ESP_OK;
 
 err:
+    if (ret == ESP_ERR_NO_MEM) {
+        ESP_LOGE(TAG,
+                 "port open no-mem: dev=%u itf=%u internal_free=%u "
+                 "internal_largest=%u dma_free=%u dma_largest=%u spiram_free=%u",
+                 (unsigned)port_config->dev_addr,
+                 (unsigned)port_config->itf_num,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                            MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                            MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     if (is_claimed_notif) {
         usb_host_interface_release(p_usbh_cdc_obj->cdc_client_hdl, cdc_port->cdc_dev->dev_hdl, cdc_port->notif.intf_desc->bInterfaceNumber);
     }
@@ -924,10 +1152,10 @@ err:
         usb_host_interface_release(p_usbh_cdc_obj->cdc_client_hdl, cdc_port->cdc_dev->dev_hdl, cdc_port->data.intf_desc->bInterfaceNumber);
     }
     if (cdc_port->in_ringbuf_handle) {
-        vRingbufferDelete(cdc_port->in_ringbuf_handle);
+        _cdc_ringbuf_delete(cdc_port->in_ringbuf_handle);
     }
     if (cdc_port->out_ringbuf_handle) {
-        vRingbufferDelete(cdc_port->out_ringbuf_handle);
+        _cdc_ringbuf_delete(cdc_port->out_ringbuf_handle);
     }
     if (cdc_port->data.out_xfer_free_sem) {
         vSemaphoreDelete(cdc_port->data.out_xfer_free_sem);
@@ -943,10 +1171,18 @@ err:
     if (new_cdc_dev) {
         _cdc_dev_ctrl_free(new_cdc_dev);
         usb_host_device_close(p_usbh_cdc_obj->cdc_client_hdl, new_cdc_dev->dev_hdl);
-        CDC_ENTER_CRITICAL();
-        SLIST_REMOVE(&(p_usbh_cdc_obj->cdc_devices_list), new_cdc_dev, usbh_cdc_dev_s, list_entry);
-        CDC_EXIT_CRITICAL();
+        if (new_dev_inserted) {
+            CDC_ENTER_CRITICAL();
+            SLIST_REMOVE(&(p_usbh_cdc_obj->cdc_devices_list),
+                         new_cdc_dev,
+                         usbh_cdc_dev_s,
+                         list_entry);
+            CDC_EXIT_CRITICAL();
+        }
         free(new_cdc_dev);
+    }
+    if (newly_opened_device != NULL) {
+        usb_host_device_close(p_usbh_cdc_obj->cdc_client_hdl, newly_opened_device);
     }
 err_exit:
     xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
@@ -957,12 +1193,20 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 {
     esp_err_t ret = ESP_OK;
     ESP_RETURN_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_INVALID_STATE, TAG, "usb cdc is not installed");
-    // Check if the port is already opened
+
+    /*
+     * DEV_GONE 与网络 supervisor 可能同时关闭同一端口。必须先取得全局关闭锁，
+     * 再检查链表并摘除节点，避免两个任务都通过检查后重复释放同一 handle。
+     */
+    xSemaphoreTake(p_usbh_cdc_obj->open_close_mutex, portMAX_DELAY);
     usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    if (!is_port_opened(cdc_port)) {
+        xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
+        ESP_LOGW(TAG, "cdc_port_handle is already closed or invalid");
+        return ESP_ERR_INVALID_ARG;
+    }
 
     cdc_port->to_close = true; // Mark port as to be closed
-    xSemaphoreTake(p_usbh_cdc_obj->open_close_mutex, portMAX_DELAY);
     usb_device_handle_t dev_hdl = cdc_port->cdc_dev->dev_hdl;
 
     CDC_ENTER_CRITICAL();
@@ -1013,11 +1257,11 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 
     if (cdc_port->in_ringbuf_handle) {
         _ringbuf_flush(cdc_port->in_ringbuf_handle);
-        vRingbufferDelete(cdc_port->in_ringbuf_handle);
+        _cdc_ringbuf_delete(cdc_port->in_ringbuf_handle);
     }
     if (cdc_port->out_ringbuf_handle) {
         _ringbuf_flush(cdc_port->out_ringbuf_handle);
-        vRingbufferDelete(cdc_port->out_ringbuf_handle);
+        _cdc_ringbuf_delete(cdc_port->out_ringbuf_handle);
     }
     if (cdc_port->data.out_xfer_free_sem) {
         vSemaphoreDelete(cdc_port->data.out_xfer_free_sem);
@@ -1026,10 +1270,14 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
         vSemaphoreDelete(cdc_port->data.out_mux);
     }
 
+    /*
+     * closed 回调必须在 open_close_mutex 内同步完成。上层会以 port_close 返回作为
+     * user_data 可释放的边界；若先解锁，另一个清理任务可能先释放 user_data，
+     * 导致回调 UAF。回调实现不得递归调用 CDC API。
+     */
     if (cdc_port->cbs.closed) {
-        cdc_port->cbs.closed((usbh_cdc_port_handle_t)cdc_port, cdc_port->cbs.user_data);
+        cdc_port->cbs.closed(cdc_port_handle, cdc_port->cbs.user_data);
     }
-
     free(cdc_port);
 
     xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
@@ -1038,20 +1286,37 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 
 esp_err_t usbh_cdc_send_custom_request(usbh_cdc_port_handle_t cdc_port_handle, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, uint16_t wLength, uint8_t *data)
 {
-    ESP_RETURN_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_INVALID_STATE, TAG, "usb cdc is not installed");
     if (wLength > 0) {
         ESP_RETURN_ON_FALSE(data != NULL, ESP_ERR_INVALID_ARG, TAG, "data is NULL");
     }
     esp_err_t ret = ESP_OK;
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+    usb_host_client_handle_t client_hdl = NULL;
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
     usbh_cdc_dev_t *cdc_dev = cdc_port->cdc_dev;
-    ESP_RETURN_ON_FALSE(cdc_dev->ctrl.xfer->data_buffer_size >= wLength, ESP_ERR_INVALID_ARG, TAG, "data buffer size is too small");
+    if (cdc_dev->ctrl.xfer->data_buffer_size < wLength) {
+        ret = ESP_ERR_INVALID_ARG;
+        ESP_LOGE(TAG, "data buffer size is too small");
+        goto unlock_port;
+    }
 
     BaseType_t taken = xSemaphoreTake(cdc_dev->ctrl.mux, pdMS_TO_TICKS(CDC_CTRL_TIMEOUT_MS));
     if (taken == pdFALSE) {
-        return ESP_ERR_TIMEOUT;
+        ret = ESP_ERR_TIMEOUT;
+        goto unlock_port;
     }
+
+    /*
+     * ctrl.mux 负责保护设备级控制传输。取得它后立即释放 open_close_mutex，
+     * 否则控制完成事件尚未返回时会阻塞同一 CDC task 继续打开复合设备的 AT
+     * 接口，形成 5 秒自锁。上层销毁流程会通过 ctrl.mux 等待本次请求结束。
+     */
+    client_hdl = owner->cdc_client_hdl;
+    _cdc_port_io_unlock(owner);
+    owner = NULL;
 
     usb_setup_packet_t *req = (usb_setup_packet_t *) cdc_dev->ctrl.xfer->data_buffer;
     uint8_t *start_of_data = (uint8_t *)req + sizeof(usb_setup_packet_t);
@@ -1063,13 +1328,13 @@ esp_err_t usbh_cdc_send_custom_request(usbh_cdc_port_handle_t cdc_port_handle, u
 
     // For IN transfers we must transfer data ownership to CDC driver
     const bool in_transfer = bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN;
-    if (!in_transfer) {
+    if (!in_transfer && wLength > 0U) {
         memcpy(start_of_data, data, wLength);
     }
 
     cdc_dev->ctrl.xfer->num_bytes = wLength + sizeof(usb_setup_packet_t);
     ESP_GOTO_ON_ERROR(
-        usb_host_transfer_submit_control(p_usbh_cdc_obj->cdc_client_hdl, cdc_dev->ctrl.xfer),
+        usb_host_transfer_submit_control(client_hdl, cdc_dev->ctrl.xfer),
         unblock, TAG, "CTRL transfer failed");
 
     taken = xSemaphoreTake((SemaphoreHandle_t)cdc_dev->ctrl.xfer->context, pdMS_TO_TICKS(CDC_CTRL_TIMEOUT_MS));
@@ -1090,21 +1355,26 @@ esp_err_t usbh_cdc_send_custom_request(usbh_cdc_port_handle_t cdc_port_handle, u
     ret = ESP_OK;
 unblock:
     xSemaphoreGive(cdc_dev->ctrl.mux);
+unlock_port:
+    _cdc_port_io_unlock(owner);
     return ret;
 }
 
 esp_err_t usbh_cdc_write_bytes(usbh_cdc_port_handle_t cdc_port_handle, const uint8_t *buf, size_t length, TickType_t ticks_to_wait)
 {
-    ESP_RETURN_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_INVALID_STATE, TAG, "usb cdc is not installed");
     ESP_RETURN_ON_FALSE(buf != NULL, ESP_ERR_INVALID_ARG, TAG, "buf is NULL");
     ESP_RETURN_ON_FALSE(length > 0, ESP_ERR_INVALID_ARG, TAG, "length is 0");
 
     esp_err_t ret = ESP_OK;
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
 
     if (xSemaphoreTake(cdc_port->data.out_mux, ticks_to_wait) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
+        ret = ESP_ERR_TIMEOUT;
+        goto unlock;
     }
 
     // if ringbuf is created, push data to ringbuf
@@ -1117,7 +1387,11 @@ esp_err_t usbh_cdc_write_bytes(usbh_cdc_port_handle_t cdc_port_handle, const uin
             _cdc_tx_xfer_submit(cdc_port->data.out_xfer);
         }
     } else {
-        ESP_RETURN_ON_FALSE(length <= cdc_port->data.out_xfer->data_buffer_size, ESP_ERR_INVALID_SIZE, TAG, "data length larger than transfer buffer size");
+        if (length > cdc_port->data.out_xfer->data_buffer_size) {
+            ret = ESP_ERR_INVALID_SIZE;
+            ESP_LOGE(TAG, "data length larger than transfer buffer size");
+            goto fail;
+        }
         // if ringbuf is not created, write data to usb
         BaseType_t taken = xSemaphoreTake(cdc_port->data.out_xfer_free_sem, ticks_to_wait);
         if (taken != pdTRUE) {
@@ -1131,18 +1405,27 @@ esp_err_t usbh_cdc_write_bytes(usbh_cdc_port_handle_t cdc_port_handle, const uin
     }
 fail:
     xSemaphoreGive(cdc_port->data.out_mux);
+unlock:
+    _cdc_port_io_unlock(owner);
     return ret;
 }
 
 esp_err_t usbh_cdc_read_bytes(usbh_cdc_port_handle_t cdc_port_handle, uint8_t *buf, size_t *length, TickType_t ticks_to_wait)
 {
     esp_err_t ret = ESP_OK;
-    ESP_RETURN_ON_FALSE(length != NULL, ESP_ERR_INVALID_ARG, TAG, "length is NULL");
-    ESP_GOTO_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_INVALID_STATE, fail, TAG, "usb cdc is not installed");
-    ESP_GOTO_ON_FALSE(buf != NULL, ESP_ERR_INVALID_ARG, fail, TAG, "buf is NULL");
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
 
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_GOTO_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, fail, TAG, "cdc_port_handle is invalid");
+    ESP_RETURN_ON_FALSE(length != NULL, ESP_ERR_INVALID_ARG, TAG, "length is NULL");
+    if (buf == NULL) {
+        *length = 0;
+        return ESP_ERR_INVALID_ARG;
+    }
+    ret = _cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port);
+    if (ret != ESP_OK) {
+        *length = 0;
+        return ret;
+    }
 
     if (cdc_port->in_ringbuf_handle == NULL && ticks_to_wait != 0) {
         ESP_LOGW(TAG, "ticks_to_wait is invalid, in_ringbuf_handle is NULL");
@@ -1158,65 +1441,92 @@ esp_err_t usbh_cdc_read_bytes(usbh_cdc_port_handle_t cdc_port_handle, uint8_t *b
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "cdc read failed");
             *length = 0;
-            return ret;
+            goto unlock;
         }
     } else {
         if (*length != cdc_port->data.in_xfer->actual_num_bytes) {
             // the length must be equal to actual_num_bytes, because we always read all the data in the buffer.
             ESP_LOGE(TAG, "length is invalid, length = %d, actual_num_bytes = %d", *length, cdc_port->data.in_xfer->actual_num_bytes);
             *length = cdc_port->data.in_xfer->actual_num_bytes;
-            return ESP_ERR_INVALID_ARG;
+            ret = ESP_ERR_INVALID_ARG;
+            goto unlock;
         }
         memcpy((void *)buf, cdc_port->data.in_xfer->data_buffer, cdc_port->data.in_xfer->actual_num_bytes);
         *length = cdc_port->data.in_xfer->actual_num_bytes;
         cdc_port->data.in_xfer->actual_num_bytes = 0; // reset actual_num_bytes
     }
-    return ESP_OK;
-fail:
-    *length = 0;
+unlock:
+    _cdc_port_io_unlock(owner);
     return ret;
 }
 
 esp_err_t usbh_cdc_flush_rx_buffer(usbh_cdc_port_handle_t cdc_port_handle)
 {
-    ESP_RETURN_ON_FALSE(cdc_port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
-    ESP_RETURN_ON_FALSE(cdc_port->in_ringbuf_handle != NULL, ESP_ERR_NOT_SUPPORTED, TAG, "rx ringbuf is not created");
-    _ringbuf_flush(cdc_port->in_ringbuf_handle);
-    return ESP_OK;
+    esp_err_t ret = ESP_OK;
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
+    if (cdc_port->in_ringbuf_handle == NULL) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+    } else {
+        _ringbuf_flush(cdc_port->in_ringbuf_handle);
+    }
+    _cdc_port_io_unlock(owner);
+    return ret;
 }
 
 esp_err_t usbh_cdc_flush_tx_buffer(usbh_cdc_port_handle_t cdc_port_handle)
 {
-    ESP_RETURN_ON_FALSE(cdc_port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
-    ESP_RETURN_ON_FALSE(cdc_port->out_ringbuf_handle != NULL, ESP_ERR_NOT_SUPPORTED, TAG, "tx ringbuf is not created");
-    _ringbuf_flush(cdc_port->out_ringbuf_handle);
-    return ESP_OK;
+    esp_err_t ret = ESP_OK;
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
+    if (cdc_port->out_ringbuf_handle == NULL) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+    } else {
+        _ringbuf_flush(cdc_port->out_ringbuf_handle);
+    }
+    _cdc_port_io_unlock(owner);
+    return ret;
 }
 
 esp_err_t usbh_cdc_get_rx_buffer_size(usbh_cdc_port_handle_t cdc_port_handle, size_t *size)
 {
-    ESP_RETURN_ON_FALSE(cdc_port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+
+    ESP_RETURN_ON_FALSE(size != NULL, ESP_ERR_INVALID_ARG, TAG, "size is NULL");
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(cdc_port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
     if (cdc_port->in_ringbuf_handle) {
         *size = _get_ringbuf_len(cdc_port->in_ringbuf_handle);
     } else {
         *size = cdc_port->data.in_xfer->actual_num_bytes;
     }
+    _cdc_port_io_unlock(owner);
     return ESP_OK;
 }
 
 esp_err_t usbh_cdc_desc_print(usbh_cdc_port_handle_t port_handle)
 {
-    ESP_RETURN_ON_FALSE(port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    esp_err_t ret = ESP_OK;
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
     usbh_cdc_dev_t *cdc_dev = cdc_port->cdc_dev;
-    ESP_RETURN_ON_FALSE(cdc_dev->dev_hdl != NULL, ESP_ERR_INVALID_STATE, TAG, "Device is not open yet");
+    if (cdc_dev->dev_hdl == NULL) {
+        ret = ESP_ERR_INVALID_STATE;
+        goto unlock;
+    }
 
     const usb_device_desc_t *device_desc;
     const usb_config_desc_t *config_desc;
@@ -1224,31 +1534,50 @@ esp_err_t usbh_cdc_desc_print(usbh_cdc_port_handle_t port_handle)
     ESP_ERROR_CHECK_WITHOUT_ABORT(usb_host_get_active_config_descriptor(cdc_dev->dev_hdl, &config_desc));
     usb_print_device_descriptor(device_desc);
     usb_print_config_descriptor(config_desc, NULL);
-    return ESP_OK;
+unlock:
+    _cdc_port_io_unlock(owner);
+    return ret;
 }
 
 esp_err_t usbh_cdc_get_dev_handle(usbh_cdc_port_handle_t port_handle, usb_device_handle_t *dev_handle)
 {
-    ESP_RETURN_ON_FALSE(port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
+    esp_err_t ret = ESP_OK;
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+
+    ESP_RETURN_ON_FALSE(dev_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "dev_handle is NULL");
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
     usbh_cdc_dev_t *cdc_dev = cdc_port->cdc_dev;
-    ESP_RETURN_ON_FALSE(cdc_dev->dev_hdl != NULL, ESP_ERR_INVALID_STATE, TAG, "Device is not open yet");
-    *dev_handle = cdc_dev->dev_hdl;
-    return ESP_OK;
+    if (cdc_dev->dev_hdl == NULL) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        *dev_handle = cdc_dev->dev_hdl;
+    }
+    _cdc_port_io_unlock(owner);
+    return ret;
 }
 
 esp_err_t usbh_cdc_port_get_intf_desc(usbh_cdc_port_handle_t port_handle, const usb_intf_desc_t **notif_intf,  const usb_intf_desc_t **data_intf)
 {
-    ESP_RETURN_ON_FALSE(port_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "port_handle is NULL");
-    usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
-    ESP_RETURN_ON_FALSE(cdc_port->cdc_dev->dev_hdl != NULL, ESP_ERR_INVALID_STATE, TAG, "Device is not open yet");
-    if (notif_intf) {
-        *notif_intf = cdc_port->notif.intf_desc;
+    esp_err_t ret = ESP_OK;
+    usbh_cdc_obj_t *owner = NULL;
+    usbh_cdc_port_t *cdc_port = NULL;
+
+    ESP_RETURN_ON_ERROR(_cdc_port_io_lock(port_handle, &owner, &cdc_port),
+                        TAG,
+                        "cdc_port_handle is invalid");
+    if (cdc_port->cdc_dev->dev_hdl == NULL) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        if (notif_intf) {
+            *notif_intf = cdc_port->notif.intf_desc;
+        }
+        if (data_intf) {
+            *data_intf = cdc_port->data.intf_desc;
+        }
     }
-    if (data_intf) {
-        *data_intf = cdc_port->data.intf_desc;
-    }
-    return ESP_OK;
+    _cdc_port_io_unlock(owner);
+    return ret;
 }

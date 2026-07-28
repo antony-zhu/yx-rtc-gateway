@@ -1,5 +1,6 @@
 ﻿#include "gw_4g_ecm.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@ static const char *TAG = "gw_4g_ecm";
 #define GW_4G_EVENT_USB_DISCONNECTED  BIT1
 #define GW_4G_EVENT_GOT_IP            BIT2
 #define GW_4G_EVENT_LOST_IP           BIT3
+#define GW_4G_EVENT_USB_OPEN_FAILED   BIT4
 #define GW_4G_NET_LOST_RETRY_US       (250ULL * 1000ULL)
 
 typedef struct {
@@ -55,9 +57,11 @@ typedef struct {
     usb_device_match_id_t cdc_match[2];
     TaskHandle_t usb_lib_task;
     volatile bool usb_host_ready;
+    volatile bool usb_stop_requested;
     bool cdc_driver_ready;
     bool cdc_callback_registered;
     volatile bool cdc_connected;
+    volatile esp_err_t cdc_open_error;
     uint8_t cdc_dev_addr;
     uint8_t cdc_itf_num;
 
@@ -66,12 +70,16 @@ typedef struct {
     bool net_lost_posting;
     bool net_lost_delivered;
     bool net_lost_suppressed;
+    bool power_baseline_ready;
+    uint32_t consecutive_start_failures;
 } gw_4g_ecm_ctx_t;
 
 static gw_4g_ecm_ctx_t s_4g;
 static portMUX_TYPE s_net_lost_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void clear_net_loss_latch(void);
+static esp_err_t ecm_stop(void);
+static esp_err_t ecm_stack_destroy(void);
 
 static int64_t now_ms(void)
 {
@@ -320,9 +328,17 @@ static void iot_eth_event_handler(void *arg,
             post_net_lost_event("ecm link down");
         }
     } else if (event_id == IOT_ETH_EVENT_STOP) {
-        copy_text(s_4g.status.reason, sizeof(s_4g.status.reason), "ecm stopped");
+        /*
+         * 启动失败后的清理会主动停止 ECM。此时不能用清理事件覆盖真正的失败阶段，
+         * 否则上层只能看到“ecm stopped”，无法区分 USB 枚举、SIM 或 IP 超时。
+         */
+        if (s_4g.status.stage != GW_4G_ECM_STAGE_FAILED) {
+            copy_text(s_4g.status.reason, sizeof(s_4g.status.reason), "ecm stopped");
+        }
     } else if (event_id == IOT_ETH_EVENT_START) {
-        copy_text(s_4g.status.reason, sizeof(s_4g.status.reason), "ecm started");
+        if (s_4g.status.stage != GW_4G_ECM_STAGE_FAILED) {
+            copy_text(s_4g.status.reason, sizeof(s_4g.status.reason), "ecm started");
+        }
     }
 }
 
@@ -344,7 +360,13 @@ static void ip_event_handler(void *arg,
         if (s_4g.events != NULL) {
             xEventGroupSetBits(s_4g.events, GW_4G_EVENT_GOT_IP);
         }
-        ESP_LOGI(TAG, "4g got ip: " IPSTR, IP2STR(&got_ip->ip_info.ip));
+        ESP_LOGI(TAG,
+                 "4g got ip=%s netmask=%s gateway=%s dns0=%s dns1=%s",
+                 s_4g.status.ip,
+                 s_4g.status.netmask,
+                 s_4g.status.gateway,
+                 s_4g.status.dns0[0] != '\0' ? s_4g.status.dns0 : "-",
+                 s_4g.status.dns1[0] != '\0' ? s_4g.status.dns1 : "-");
         return;
     }
 
@@ -451,6 +473,7 @@ static bool is_detected(void)
 static void power_on(void)
 {
     ESP_LOGI(TAG, "4g power on");
+    s_4g.power_baseline_ready = false;
     (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_CTRL, 1);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -468,6 +491,27 @@ static void power_off(void)
     ESP_LOGI(TAG, "4g power off");
     (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_EN, 1);
     (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_CTRL, 0);
+
+    /*
+     * POWER_CTRL 拉低后必须给模组和 USB 端点足够的放电、离线时间。旧实现立即
+     * 开始下一轮，CDC/ECM client 会继续保留上一代设备对象，最终形成无限枚举
+     * 超时。等待结束后恢复 POWER_EN 的空闲电平，确保下一轮得到完整上电脉冲。
+     */
+    vTaskDelay(pdMS_TO_TICKS(GW_4G_POWER_OFF_SETTLE_MS));
+    (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_EN, 0);
+    s_4g.power_baseline_ready = true;
+}
+
+/** @brief 连续普通恢复仍失败时，对已上电模组执行一次硬件复位。 */
+static void hardware_reset(void)
+{
+    ESP_LOGW(TAG,
+             "4g consecutive failures=%" PRIu32 ", pulse hardware reset",
+             s_4g.consecutive_start_failures);
+    (void)gpio_set_level((gpio_num_t)GW_4G_PIN_RESET, 1);
+    vTaskDelay(pdMS_TO_TICKS(GW_4G_RESET_PULSE_MS));
+    (void)gpio_set_level((gpio_num_t)GW_4G_PIN_RESET, 0);
+    vTaskDelay(pdMS_TO_TICKS(GW_4G_RESET_DELAY_MS));
 }
 
 static bool usb_enum_filter_cb(const usb_device_desc_t *dev_desc, uint8_t *configuration_value)
@@ -527,11 +571,27 @@ static void usb_lib_task(void *arg)
         if (has_devices && (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0U) {
             has_clients = false;
         }
+
+        /*
+         * CDC 可能在注册 USB client 之前就创建失败，此时不会产生 NO_CLIENTS
+         * 边沿。显式释放请求覆盖该分支，确保空 Host 也能退出。
+         */
+        if (s_4g.usb_stop_requested) {
+            usb_host_lib_info_t info = {0};
+            if (usb_host_lib_info(&info) == ESP_OK && info.num_clients == 0) {
+                if (usb_host_device_free_all() == ESP_OK) {
+                    has_clients = false;
+                } else {
+                    has_devices = true;
+                }
+            }
+        }
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
     (void)usb_host_uninstall();
     s_4g.usb_host_ready = false;
+    s_4g.usb_stop_requested = false;
     s_4g.usb_lib_task = NULL;
     ESP_LOGI(TAG, "usb host library uninstalled");
     vTaskDelete(NULL);
@@ -541,6 +601,9 @@ static bool wait_usb_host_release(uint32_t timeout_ms)
 {
     uint32_t waited_ms = 0;
 
+    if (s_4g.usb_lib_task != NULL) {
+        s_4g.usb_stop_requested = true;
+    }
     while (s_4g.usb_lib_task != NULL && waited_ms < timeout_ms) {
         (void)usb_host_lib_unblock();
         vTaskDelay(pdMS_TO_TICKS(GW_4G_USB_HOST_POLL_MS));
@@ -555,7 +618,7 @@ static esp_err_t install_usb_host_library(void)
     BaseType_t ok = pdFAIL;
 
     if (s_4g.usb_lib_task != NULL) {
-        if (s_4g.usb_host_ready) {
+        if (s_4g.usb_host_ready && !s_4g.usb_stop_requested) {
             return ESP_OK;
         }
         if (!wait_usb_host_release(GW_4G_USB_HOST_RELEASE_MS)) {
@@ -564,6 +627,7 @@ static esp_err_t install_usb_host_library(void)
     }
 
     s_4g.usb_host_ready = false;
+    s_4g.usb_stop_requested = false;
     ok = xTaskCreatePinnedToCore(usb_lib_task,
                                  "gw_4g_usb",
                                  4096,
@@ -573,6 +637,7 @@ static esp_err_t install_usb_host_library(void)
                                  0);
     if (ok != pdPASS) {
         s_4g.usb_lib_task = NULL;
+        s_4g.usb_stop_requested = false;
         return ESP_ERR_NO_MEM;
     }
 
@@ -586,9 +651,15 @@ static esp_err_t install_usb_host_library(void)
 
 static void cdc_port_closed_cb(usbh_cdc_port_handle_t cdc_port_handle, void *user_data)
 {
-    (void)cdc_port_handle;
     (void)user_data;
 
+    /*
+     * closed 回调在组件解锁后执行；若新一代 USB 端口已先完成打开，旧回调不能
+     * 清掉新句柄。只处理与当前保存句柄一致的关闭通知。
+     */
+    if (s_4g.cdc_port != cdc_port_handle) {
+        return;
+    }
     ESP_LOGW(TAG, "4g at cdc port closed");
     s_4g.cdc_port = NULL;
     s_4g.cdc_dev_addr = 0;
@@ -630,9 +701,12 @@ static void cdc_device_event_cb(usbh_cdc_device_event_t event,
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "open 4g at cdc port failed: %s", esp_err_to_name(ret));
             s_4g.cdc_port = NULL;
+            s_4g.cdc_open_error = ret;
+            xEventGroupSetBits(s_4g.events, GW_4G_EVENT_USB_OPEN_FAILED);
             return;
         }
 
+        s_4g.cdc_open_error = ESP_OK;
         s_4g.cdc_dev_addr = event_data->new_dev.dev_addr;
         s_4g.cdc_itf_num = (uint8_t)matched_itf_num;
         s_4g.cdc_connected = true;
@@ -644,15 +718,22 @@ static void cdc_device_event_cb(usbh_cdc_device_event_t event,
         break;
     }
     case CDC_HOST_DEVICE_EVENT_DISCONNECTED:
-        if (event_data != NULL &&
-            s_4g.cdc_dev_addr != 0U &&
+        /*
+         * 模组可能先以地址 1 枚举引导接口，再以地址 2 枚举正式复合设备。
+         * 未打开 AT 端口时的 DEV_GONE 不属于本连接，不能误报 USB 断线。
+         */
+        if (event_data == NULL ||
+            s_4g.cdc_dev_addr == 0U ||
             s_4g.cdc_dev_addr != event_data->dev_gone.dev_addr) {
             return;
         }
         ESP_LOGW(TAG, "4g usb disconnected");
-        s_4g.cdc_port = NULL;
         s_4g.cdc_dev_addr = 0;
         s_4g.cdc_connected = false;
+        /*
+         * 保留端口句柄直到同步 closed 回调清除，确保恢复任务调用 port_close 时
+         * 会等待 CDC task 完成资源回收，而不是越过尚在进行的关闭流程。
+         */
         xEventGroupSetBits(s_4g.events, GW_4G_EVENT_USB_DISCONNECTED);
         break;
     default:
@@ -906,6 +987,50 @@ static esp_err_t at_command(const char *command,
             ESP_LOGW(TAG, "AT failed cmd=%s err=%s", log_command, esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    s_4g.status.at_busy = false;
+    (void)xSemaphoreGive(s_4g.at_lock);
+    return err;
+}
+
+/**
+ * @brief 只发送一条会触发 USB 断开的 AT 命令，不等待响应。
+ *
+ * 模组重启命令可能在回复 OK 前直接移除 CDC 端点。命令成功进入 USB OUT 队列后
+ * 就立即停止访问端口，后续以 DEV_GONE 和重新枚举为判据，避免读线程与端口释放
+ * 并发造成 UAF。
+ */
+static esp_err_t at_send_no_response(const char *command)
+{
+    char cmd[160] = {0};
+    size_t cmd_len = 0;
+    esp_err_t err = ESP_OK;
+
+    if (command == NULL || command[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_4g.at_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cmd_len = strlen(command);
+    if (cmd_len >= (sizeof(cmd) - 3U)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    (void)snprintf(cmd, sizeof(cmd), "%s", command);
+    if (cmd_len < 2U || cmd[cmd_len - 2U] != '\r' || cmd[cmd_len - 1U] != '\n') {
+        cmd[cmd_len++] = '\r';
+        cmd[cmd_len++] = '\n';
+        cmd[cmd_len] = '\0';
+    }
+
+    if (xSemaphoreTake(s_4g.at_lock, pdMS_TO_TICKS(1200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_4g.status.at_busy = true;
+    at_drain_rx();
+    if (cdc_write((const uint8_t *)cmd, cmd_len, 200) < 0) {
+        err = ESP_ERR_INVALID_STATE;
     }
     s_4g.status.at_busy = false;
     (void)xSemaphoreGive(s_4g.at_lock);
@@ -1202,13 +1327,26 @@ static esp_err_t wait_usb_connected(uint32_t timeout_ms)
     if (s_4g.cdc_connected) {
         return ESP_OK;
     }
-    xEventGroupClearBits(s_4g.events, GW_4G_EVENT_USB_CONNECTED | GW_4G_EVENT_USB_DISCONNECTED);
+    if (s_4g.cdc_open_error != ESP_OK) {
+        return s_4g.cdc_open_error;
+    }
     bits = xEventGroupWaitBits(s_4g.events,
-                               GW_4G_EVENT_USB_CONNECTED,
+                               GW_4G_EVENT_USB_CONNECTED |
+                                   GW_4G_EVENT_USB_DISCONNECTED |
+                                   GW_4G_EVENT_USB_OPEN_FAILED,
                                pdTRUE,
                                pdFALSE,
                                pdMS_TO_TICKS(timeout_ms));
-    return (bits & GW_4G_EVENT_USB_CONNECTED) != 0U ? ESP_OK : ESP_ERR_TIMEOUT;
+    if ((bits & GW_4G_EVENT_USB_CONNECTED) != 0U) {
+        return ESP_OK;
+    }
+    if ((bits & GW_4G_EVENT_USB_OPEN_FAILED) != 0U &&
+        s_4g.cdc_open_error != ESP_OK) {
+        return s_4g.cdc_open_error;
+    }
+    return (bits & GW_4G_EVENT_USB_DISCONNECTED) != 0U ?
+               ESP_ERR_INVALID_STATE :
+               ESP_ERR_TIMEOUT;
 }
 
 static esp_err_t modem_wait_ready_ms(uint32_t timeout_ms)
@@ -1221,6 +1359,112 @@ static esp_err_t modem_wait_ready_ms(uint32_t timeout_ms)
             return ESP_OK;
         }
         vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief 当前 USB 描述符缺少 ECM 接口时，强制模组以 ECM 模式重新枚举。
+ *
+ * ML307A 的拨号模式设置要在模组重启后才反映到 USB 配置描述符。仅做 GPIO
+ * 上电脉冲可能保留异常 USB 模式，因此这里通过文档命令写 mode=1 并执行一次
+ * 模组软重启；CDC/ECM client 保持常驻，等待同一 USB Host 内完成重新枚举。
+ */
+static esp_err_t modem_recover_ecm_usb_descriptor(void)
+{
+    uint8_t previous_dev_addr = s_4g.cdc_dev_addr;
+    bool saw_disconnect = false;
+    bool fallback_reboot_sent = false;
+    esp_err_t reboot_err = ESP_FAIL;
+    int64_t deadline_ms = 0;
+    int64_t fallback_reboot_ms = 0;
+
+    ESP_LOGW(TAG,
+             "USB config has no ECM interface; force modem ECM re-enumeration");
+    ESP_RETURN_ON_ERROR(at_command("AT", "\r\nOK\r\n", 600, 2, NULL, 0),
+                        TAG,
+                        "modem unavailable before ECM recovery");
+    ESP_RETURN_ON_ERROR(at_command("AT+MDIALUPCFG=\"mode\",1",
+                                   "\r\nOK\r\n",
+                                   2000,
+                                   2,
+                                   NULL,
+                                   0),
+                        TAG,
+                        "set ECM USB mode failed");
+
+    s_4g.cdc_open_error = ESP_OK;
+    xEventGroupClearBits(s_4g.events,
+                         GW_4G_EVENT_USB_CONNECTED |
+                             GW_4G_EVENT_USB_DISCONNECTED |
+                             GW_4G_EVENT_USB_OPEN_FAILED);
+
+    reboot_err = at_send_no_response("AT+CFUN=1,1");
+    if (reboot_err != ESP_OK && s_4g.cdc_connected) {
+        reboot_err = at_send_no_response("AT+MREBOOT=0");
+        if (reboot_err != ESP_OK && s_4g.cdc_connected) {
+            reboot_err = at_send_no_response("AT+MREBOOT");
+        }
+    }
+    /*
+     * 部分固件在回复 OK 前就断开 AT 端点，此时命令层会报失败，但重启已经发生。
+     * 以实际 USB 断开/重连为准，避免把成功的重启误判为失败。
+     */
+    if (reboot_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "modem reboot command returned %s; wait for USB re-enumeration",
+                 esp_err_to_name(reboot_err));
+    }
+
+    deadline_ms = now_ms() + (int64_t)GW_4G_ECM_USB_REENUM_TIMEOUT_MS;
+    fallback_reboot_ms = now_ms() + 5000;
+    while (now_ms() < deadline_ms) {
+        EventBits_t usb_bits = xEventGroupGetBits(s_4g.events);
+
+        if ((usb_bits & GW_4G_EVENT_USB_DISCONNECTED) != 0U ||
+            !s_4g.cdc_connected ||
+            s_4g.cdc_dev_addr == 0U ||
+            s_4g.cdc_dev_addr != previous_dev_addr) {
+            saw_disconnect = true;
+        }
+
+        if (saw_disconnect && s_4g.cdc_connected) {
+            usbh_cdc_port_handle_t ecm_port =
+                usb_ecm_get_cdc_port_handle(s_4g.ecm_driver);
+            esp_err_t connect_err =
+                usb_ecm_get_last_connect_error(s_4g.ecm_driver);
+
+            if (ecm_port != NULL && connect_err == ESP_OK) {
+                ESP_LOGI(TAG,
+                         "modem re-enumerated with ECM dev=%u",
+                         (unsigned)s_4g.cdc_dev_addr);
+                return ESP_OK;
+            }
+            /*
+             * ECM callback 在 AT callback 之前、且两者位于同一 CDC task。
+             * 因此 AT 已重新连上时，connect_err 已是本代设备的最终打开结果。
+            */
+            return connect_err != ESP_OK ? connect_err : ESP_ERR_NOT_FOUND;
+        }
+        if (!saw_disconnect &&
+            !fallback_reboot_sent &&
+            s_4g.cdc_connected &&
+            now_ms() >= fallback_reboot_ms) {
+            /*
+             * CFUN 返回 OK 也不代表模组确实重启。5 秒内没有真实 DEV_GONE 时，
+             * 按 ML307A 文档补发 MREBOOT=0，仍以 USB 断开/重枚举作为判据。
+             */
+            ESP_LOGW(TAG, "CFUN did not re-enumerate USB; send AT+MREBOOT=0");
+            fallback_reboot_sent = true;
+            reboot_err = at_send_no_response("AT+MREBOOT=0");
+            if (reboot_err != ESP_OK && s_4g.cdc_connected) {
+                reboot_err = at_send_no_response("AT+MREBOOT");
+            }
+        }
+        if (s_4g.cdc_open_error != ESP_OK) {
+            return s_4g.cdc_open_error;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     return ESP_ERR_TIMEOUT;
 }
@@ -1250,12 +1494,12 @@ static esp_err_t modem_enter_ecm(char *status, size_t status_size)
     mode = modem_get_mdialup_mode();
     if (mode != 1) {
         ESP_LOGW(TAG, "ECM mode inactive mode=%d, reboot modem", mode);
-        if (at_command("AT+CFUN=1,1", "\r\nOK\r\n", 2000, 1, NULL, 0) != ESP_OK &&
-            at_command("AT+MREBOOT", "\r\nOK\r\n", 2000, 1, NULL, 0) != ESP_OK) {
-            return ESP_FAIL;
-        }
-        vTaskDelay(pdMS_TO_TICKS(6000));
-        ESP_RETURN_ON_ERROR(modem_wait_ready_ms(25000), TAG, "modem not ready after reboot");
+        ESP_RETURN_ON_ERROR(modem_recover_ecm_usb_descriptor(),
+                            TAG,
+                            "ECM mode reboot/re-enumeration failed");
+        ESP_RETURN_ON_ERROR(modem_wait_ready_ms(5000),
+                            TAG,
+                            "modem not ready after ECM re-enumeration");
         mode = modem_get_mdialup_mode();
         if (mode != 1) {
             return ESP_ERR_INVALID_RESPONSE;
@@ -1299,6 +1543,8 @@ static esp_err_t ecm_stack_create(void)
     iot_eth_config_t eth_cfg = {0};
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
 
+    esp_err_t err = ESP_OK;
+
     if (s_4g.ecm_stack_ready) {
         return ESP_OK;
     }
@@ -1308,24 +1554,49 @@ static esp_err_t ecm_stack_create(void)
     s_4g.ecm_match[0].idVendor = GW_4G_USB_VID;
     s_4g.ecm_match[0].idProduct = GW_4G_USB_PID;
 
-    ESP_RETURN_ON_ERROR(iot_eth_new_usb_ecm(&ecm_cfg, &s_4g.ecm_driver),
-                        TAG,
-                        "iot_eth_new_usb_ecm failed");
+    err = iot_eth_new_usb_ecm(&ecm_cfg, &s_4g.ecm_driver);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "iot_eth_new_usb_ecm failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
     eth_cfg.driver = s_4g.ecm_driver;
-    ESP_RETURN_ON_ERROR(iot_eth_install(&eth_cfg, &s_4g.ecm_eth),
-                        TAG,
-                        "iot_eth_install failed");
+    err = iot_eth_install(&eth_cfg, &s_4g.ecm_eth);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "iot_eth_install failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
 
     s_4g.ecm_netif = esp_netif_new(&netif_cfg);
-    ESP_RETURN_ON_FALSE(s_4g.ecm_netif != NULL, ESP_ERR_NO_MEM, TAG, "create ecm netif failed");
+    if (s_4g.ecm_netif == NULL) {
+        err = ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "create ecm netif failed");
+        goto fail;
+    }
     s_4g.ecm_glue = iot_eth_new_netif_glue(s_4g.ecm_eth);
-    ESP_RETURN_ON_FALSE(s_4g.ecm_glue != NULL, ESP_ERR_NO_MEM, TAG, "create ecm glue failed");
-    ESP_RETURN_ON_ERROR(esp_netif_attach(s_4g.ecm_netif, s_4g.ecm_glue),
-                        TAG,
-                        "attach ecm netif failed");
+    if (s_4g.ecm_glue == NULL) {
+        err = ESP_ERR_NO_MEM;
+        ESP_LOGE(TAG, "create ecm glue failed");
+        goto fail;
+    }
+    err = esp_netif_attach(s_4g.ecm_netif, s_4g.ecm_glue);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "attach ecm netif failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
 
     s_4g.ecm_stack_ready = true;
     return ESP_OK;
+
+fail:
+    {
+        esp_err_t cleanup_err = ecm_stack_destroy();
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "cleanup partial ECM stack failed: %s",
+                     esp_err_to_name(cleanup_err));
+        }
+    }
+    return err;
 }
 
 static esp_err_t ecm_start(void)
@@ -1351,15 +1622,174 @@ static esp_err_t ecm_start(void)
     return ESP_FAIL;
 }
 
-static void ecm_stop(void)
+static esp_err_t ecm_stop(void)
 {
     if (s_4g.ecm_started && s_4g.ecm_eth != NULL) {
-        if (iot_eth_stop(s_4g.ecm_eth) != ESP_OK) {
-            ESP_LOGW(TAG, "iot_eth_stop failed");
+        esp_err_t err = iot_eth_stop(s_4g.ecm_eth);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "iot_eth_stop failed: %s", esp_err_to_name(err));
+            return err;
         }
     }
     s_4g.ecm_started = false;
     xEventGroupClearBits(s_4g.events, GW_4G_EVENT_GOT_IP | GW_4G_EVENT_LOST_IP);
+    return ESP_OK;
+}
+
+/** @brief 关闭一个仍存活的 CDC 端口；异步拔出造成的已关闭状态按成功处理。 */
+static esp_err_t close_cdc_port(usbh_cdc_port_handle_t port, const char *name)
+{
+    if (port == NULL) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = usbh_cdc_port_close(port);
+    if (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGI(TAG, "%s CDC port already closed", name);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "close %s CDC port failed: %s", name, esp_err_to_name(err));
+    }
+    return err;
+}
+
+/**
+ * @brief 彻底销毁本轮 ECM 数据栈。
+ *
+ * 仅调用 iot_eth_stop() 不会注销 USB ECM callback，也不会释放 CDC 端口。这里
+ * 按 glue/netif/driver 的逆序销毁，确保下一轮不会复用上一代 USB 设备对象。
+ */
+static esp_err_t ecm_stack_destroy(void)
+{
+    esp_err_t first_err = ESP_OK;
+    usbh_cdc_port_handle_t ecm_port =
+        s_4g.ecm_driver != NULL ? usb_ecm_get_cdc_port_handle(s_4g.ecm_driver) : NULL;
+
+    esp_err_t stop_err = ecm_stop();
+    if (stop_err != ESP_OK) {
+        return stop_err;
+    }
+
+    /*
+     * ECM CDC transfer callback 的 user_data 指向 ecm_driver。必须先关闭并排空
+     * 端口，再 uninstall/free driver，避免 pending callback 访问已释放对象。
+     */
+    esp_err_t close_err = close_cdc_port(ecm_port, "ECM");
+    if (close_err != ESP_OK) {
+        return close_err;
+    }
+
+    if (s_4g.ecm_glue != NULL) {
+        esp_err_t err = iot_eth_del_netif_glue(s_4g.ecm_glue);
+        if (err != ESP_OK && first_err == ESP_OK) {
+            first_err = err;
+        }
+        s_4g.ecm_glue = NULL;
+    }
+    if (s_4g.ecm_netif != NULL) {
+        esp_netif_destroy(s_4g.ecm_netif);
+        s_4g.ecm_netif = NULL;
+    }
+    if (s_4g.ecm_eth != NULL) {
+        esp_err_t err = iot_eth_uninstall(s_4g.ecm_eth);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "uninstall ECM driver failed: %s", esp_err_to_name(err));
+            if (first_err == ESP_OK) {
+                first_err = err;
+            }
+        } else {
+            s_4g.ecm_eth = NULL;
+            s_4g.ecm_driver = NULL;
+        }
+    } else if (s_4g.ecm_driver != NULL) {
+        /*
+         * iot_eth_install() 失败时 USB ECM init 已回滚内部对象，但创建函数分配的
+         * driver 外壳仍由调用方拥有。
+         */
+        free(s_4g.ecm_driver);
+        s_4g.ecm_driver = NULL;
+    }
+
+    if (s_4g.ecm_eth == NULL && s_4g.ecm_driver == NULL) {
+        s_4g.ecm_stack_ready = false;
+    }
+    return first_err;
+}
+
+/**
+ * @brief 卸载 CDC client 和 USB Host，保证下一轮从全新枚举状态启动。
+ *
+ * 物理断电通知与当前任务可能并发到达，因此端口关闭和 callback 注销都保持
+ * 幂等；CDC 卸载短暂遇到设备仍在释放时会有限重试。
+ */
+static esp_err_t usb_stack_destroy(void)
+{
+    esp_err_t first_err = ecm_stack_destroy();
+    if (first_err != ESP_OK) {
+        /*
+         * ECM driver 仍存活时禁止继续卸载其 CDC/USB Host 依赖；保留真实状态，
+         * 让上层执行下一轮有界恢复，而不是构造半释放的 split-brain 栈。
+         */
+        return first_err;
+    }
+
+    if (s_4g.cdc_callback_registered) {
+        esp_err_t err = usbh_cdc_unregister_dev_event_cb(cdc_device_event_cb);
+        if (err == ESP_OK || err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_STATE) {
+            s_4g.cdc_callback_registered = false;
+        } else if (first_err == ESP_OK) {
+            first_err = err;
+        }
+    }
+
+    esp_err_t close_err = close_cdc_port(s_4g.cdc_port, "AT");
+    if (close_err != ESP_OK && first_err == ESP_OK) {
+        first_err = close_err;
+    }
+    s_4g.cdc_port = NULL;
+    s_4g.cdc_connected = false;
+    s_4g.cdc_open_error = ESP_OK;
+    s_4g.cdc_dev_addr = 0;
+
+    if (s_4g.cdc_driver_ready) {
+        esp_err_t err = ESP_FAIL;
+        for (uint32_t attempt = 0; attempt < GW_4G_USB_TEARDOWN_RETRIES; ++attempt) {
+            err = usbh_cdc_driver_uninstall();
+            if (err == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG,
+                     "uninstall CDC driver retry %" PRIu32 "/%u: %s",
+                     attempt + 1U,
+                     (unsigned)GW_4G_USB_TEARDOWN_RETRIES,
+                     esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (err == ESP_OK) {
+            s_4g.cdc_driver_ready = false;
+            s_4g.cdc_callback_registered = false;
+        } else if (first_err == ESP_OK) {
+            first_err = err;
+        }
+    }
+
+    if (!s_4g.cdc_driver_ready &&
+        !wait_usb_host_release(GW_4G_USB_HOST_RELEASE_MS) &&
+        first_err == ESP_OK) {
+        first_err = ESP_ERR_TIMEOUT;
+    }
+
+    xEventGroupClearBits(s_4g.events,
+                         GW_4G_EVENT_USB_CONNECTED |
+                             GW_4G_EVENT_USB_DISCONNECTED |
+                             GW_4G_EVENT_USB_OPEN_FAILED |
+                             GW_4G_EVENT_GOT_IP |
+                             GW_4G_EVENT_LOST_IP);
+    if (first_err == ESP_OK) {
+        ESP_LOGI(TAG, "4g USB/CDC/ECM stack fully released");
+    }
+    return first_err;
 }
 
 esp_err_t gw_4g_ecm_init(void)
@@ -1396,11 +1826,43 @@ esp_err_t gw_4g_ecm_init(void)
     return ESP_OK;
 }
 
+esp_err_t gw_4g_ecm_prepare_usb(void)
+{
+    ESP_RETURN_ON_ERROR(gw_4g_ecm_init(), TAG, "4g init failed");
+    ESP_RETURN_ON_ERROR(port_init(), TAG, "4g gpio prepare failed");
+
+    /*
+     * CPU 复位不会保证 4G 模组同步掉电。首次准备先建立一次完整的 5 秒断电
+     * 基线，避免仍带电的模组和上一代 USB 端点进入新 Host 生命周期。
+     */
+    if (!s_4g.power_baseline_ready) {
+        power_off();
+    }
+
+    esp_err_t err = cdc_init();
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    /*
+     * 预留阶段不允许留下半初始化 Host。即使 CDC 在注册 client 之前失败，
+     * 显式 stop 请求也会让空 Host 退出，后续联网任务可从干净状态重试。
+     */
+    esp_err_t cleanup_err = usb_stack_destroy();
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "cleanup failed USB preparation: %s",
+                 esp_err_to_name(cleanup_err));
+    }
+    return err;
+}
+
 esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
 {
     uint32_t timeout_ms = (config != NULL && config->timeout_ms > 0U) ? config->timeout_ms : 120000U;
     const char *apn = (config != NULL && config->apn != NULL) ? config->apn : "";
     char ecm_status[GW_4G_AT_RESPONSE_BUFFER_BYTES] = {0};
+    char failure_reason[sizeof(s_4g.status.reason)] = {0};
     EventBits_t bits = 0;
     esp_err_t err = ESP_OK;
 
@@ -1413,16 +1875,12 @@ esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
     clear_ip_status();
     copy_text(s_4g.status.apn, sizeof(s_4g.status.apn), apn);
 
-    err = port_init();
+    err = gw_4g_ecm_prepare_usb();
     if (err != ESP_OK) {
         goto fail;
     }
     if (!is_detected()) {
         ESP_LOGW(TAG, "4g detect pin is not active, continue");
-    }
-    err = cdc_init();
-    if (err != ESP_OK) {
-        goto fail;
     }
     err = ecm_stack_create();
     if (err != ESP_OK) {
@@ -1433,11 +1891,45 @@ esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
         goto fail;
     }
 
+    /*
+     * 清除上一代枚举结果后再上电。连接回调若在 wait 之前失败，会同时写入
+     * cdc_open_error 和事件位，因此不会丢失，也不再无意义等待 30 秒。
+     */
+    s_4g.cdc_open_error = ESP_OK;
+    xEventGroupClearBits(s_4g.events,
+                         GW_4G_EVENT_USB_CONNECTED |
+                             GW_4G_EVENT_USB_DISCONNECTED |
+                             GW_4G_EVENT_USB_OPEN_FAILED);
     power_on();
+    if (s_4g.consecutive_start_failures >= GW_4G_HARD_RESET_AFTER_FAILURES) {
+        hardware_reset();
+    }
     set_stage(GW_4G_ECM_STAGE_WAIT_USB, "4g wait usb", config);
     err = wait_usb_connected(GW_4G_WAIT_USB_TIMEOUT_MS);
     if (err != ESP_OK) {
         goto fail;
+    }
+    if (usb_ecm_get_cdc_port_handle(s_4g.ecm_driver) == NULL) {
+        esp_err_t ecm_connect_err =
+            usb_ecm_get_last_connect_error(s_4g.ecm_driver);
+
+        if (ecm_connect_err == ESP_ERR_NOT_FOUND) {
+            /*
+             * 新模组或异常掉电后的模组可能只枚举 AT 接口。走正式 AT 配置流程
+             * 切到 ECM 并软重启，不要求用户给整块网关断电。
+             */
+            err = modem_recover_ecm_usb_descriptor();
+        } else {
+            err = ecm_connect_err != ESP_OK ?
+                      ecm_connect_err :
+                      ESP_ERR_INVALID_STATE;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "ECM data port recovery failed: %s",
+                     esp_err_to_name(err));
+            goto fail;
+        }
     }
 
     set_stage(GW_4G_ECM_STAGE_PROBING, "4g probing", config);
@@ -1488,17 +1980,41 @@ esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
     }
 
     set_stage(GW_4G_ECM_STAGE_READY, "4g ready", config);
+    s_4g.consecutive_start_failures = 0;
     ESP_LOGI(TAG, "4g ready");
     (void)gw_4g_ecm_refresh_modem_info(2000);
     return ESP_OK;
 
 fail:
+    {
+        gw_4g_ecm_stage_t failed_stage = s_4g.status.stage;
+        (void)snprintf(failure_reason,
+                       sizeof(failure_reason),
+                       "%s:%s",
+                       gw_4g_ecm_stage_to_string(failed_stage),
+                       esp_err_to_name(err));
+        if (s_4g.consecutive_start_failures < UINT32_MAX) {
+            ++s_4g.consecutive_start_failures;
+        }
+        ESP_LOGW(TAG,
+                 "4g start failed: stage=%s err=%s consecutive=%" PRIu32
+                 ", rebuild USB stack",
+                 gw_4g_ecm_stage_to_string(failed_stage),
+                 esp_err_to_name(err),
+                 s_4g.consecutive_start_failures);
+    }
     clear_ip_status();
     s_4g.status.modem.registered = false;
-    set_stage(GW_4G_ECM_STAGE_FAILED, esp_err_to_name(err), config);
     suppress_net_loss(true);
-    ecm_stop();
+    (void)ecm_stop();
     power_off();
+    esp_err_t cleanup_err = usb_stack_destroy();
+    if (cleanup_err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "4g recovery cleanup failed: %s",
+                 esp_err_to_name(cleanup_err));
+    }
+    set_stage(GW_4G_ECM_STAGE_FAILED, failure_reason, config);
     return err;
 }
 
@@ -1510,11 +2026,28 @@ esp_err_t gw_4g_ecm_stop(void)
     if (s_4g.status.stage == GW_4G_ECM_STAGE_READY) {
         (void)modem_exit_ecm();
     }
-    ecm_stop();
-    power_off();
+    bool resources_active = s_4g.ecm_stack_ready ||
+                            s_4g.ecm_started ||
+                            s_4g.cdc_driver_ready ||
+                            s_4g.cdc_port != NULL ||
+                            s_4g.usb_lib_task != NULL;
+    esp_err_t cleanup_err = ESP_OK;
+    if (resources_active) {
+        (void)ecm_stop();
+        power_off();
+        cleanup_err = usb_stack_destroy();
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "stop 4g recovery cleanup failed: %s",
+                     esp_err_to_name(cleanup_err));
+        }
+    } else {
+        (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_EN, 0);
+        (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_CTRL, 0);
+    }
     clear_ip_status();
     set_stage(GW_4G_ECM_STAGE_STOPPED, "stopped", NULL);
-    return ESP_OK;
+    return cleanup_err;
 }
 
 esp_err_t gw_4g_ecm_get_status(gw_4g_ecm_status_t *out)

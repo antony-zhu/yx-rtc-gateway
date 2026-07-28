@@ -89,11 +89,22 @@ typedef struct {
 /**
  * @brief 初始化 4G USB ECM 驱动。
  *
- * 初始化事件组、互斥锁、ESP-NETIF 和 ESP 事件循环，但不启动网络。
+ * 初始化事件组、互斥锁和内部状态，但不分配 USB task，也不启动网络。
  *
  * @return ESP_OK 表示成功。
  */
 esp_err_t gw_4g_ecm_init(void);
+
+/**
+ * @brief 提前准备 4G GPIO、USB Host 和 CDC 控制通道。
+ *
+ * 应在 BLE 初始化完成后、其他大任务创建前调用，以提前保留 CDC 所需的连续
+ * 片内任务栈。该函数不打开 4G 电源、不拨号；失败时会回滚已创建资源，后续
+ * `gw_4g_ecm_start()` 仍可重试。
+ *
+ * @return ESP_OK 表示 USB/CDC 资源已经准备完成。
+ */
+esp_err_t gw_4g_ecm_prepare_usb(void);
 
 /**
  * @brief 阻塞启动一轮 4G USB ECM 联网。

@@ -27,6 +27,7 @@
 #include "gw_log_task.h"
 #include "gw_mqtt_manager.h"
 #include "gw_net.h"
+#include "gw_4g_ecm.h"
 #include "gw_ota.h"
 #include "gw_param.h"
 #include "gw_protocol_manager.h"
@@ -1037,6 +1038,16 @@ static void run_runtime_boot(void)
      * 的运行期分配启动；这样可以降低长时间运行后的内部堆碎片风险。
      */
     ESP_ERROR_CHECK(gw_ble_config_init());
+    /*
+     * CDC task 的 12 KiB 栈必须位于片内 RAM。BLE 完成后立即预留，避免文件系统
+     * 和业务任务把连续片内块切碎；预留失败不阻断启动，网络 supervisor 会重试。
+     */
+    esp_err_t usb_prepare_err = gw_4g_ecm_prepare_usb();
+    if (usb_prepare_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "early 4g USB preparation failed; defer to network recovery: %s",
+                 esp_err_to_name(usb_prepare_err));
+    }
 
     gw_storage_identity_t identity;
     ESP_ERROR_CHECK(gw_storage_get_identity(&identity));

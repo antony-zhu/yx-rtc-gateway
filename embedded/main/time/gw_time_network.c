@@ -16,10 +16,14 @@
 
 #define GW_TIME_NETWORK_NOTIFY_REQUEST  (1UL << 0)
 #define GW_TIME_NETWORK_NOTIFY_SYNCED   (1UL << 1)
+#define GW_TIME_NETWORK_STACK_DEPTH \
+    (GW_TASK_STACK_TIME_SYNC_BYTES / sizeof(StackType_t))
 
 static const char *TAG = "gw_time_network";
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_worker_task;
+static StaticTask_t s_worker_task_buffer;
+static StackType_t s_worker_task_stack[GW_TIME_NETWORK_STACK_DEPTH];
 static bool s_pending_sntp_valid;
 static uint64_t s_pending_sntp_utc_ms;
 static uint64_t s_pending_sntp_uptime_ms;
@@ -175,14 +179,18 @@ static void time_network_worker(void *arg)
 esp_err_t gw_time_network_sync_request(void)
 {
     if (s_worker_task == NULL) {
-        BaseType_t created = xTaskCreate(time_network_worker,
-                                         "time_sync",
-                                         GW_TASK_STACK_TIME_SYNC_BYTES,
-                                         NULL,
-                                         GW_TIME_SYNC_TASK_PRIORITY,
-                                         &s_worker_task);
-        if (created != pdPASS) {
-            s_worker_task = NULL;
+        /*
+         * 校时 worker 常驻且只有一个实例，使用静态栈可在链接期预留空间，避免
+         * 4G endpoint 建立后片内堆碎片导致首次网络校时无法创建任务。
+         */
+        s_worker_task = xTaskCreateStatic(time_network_worker,
+                                          "time_sync",
+                                          GW_TIME_NETWORK_STACK_DEPTH,
+                                          NULL,
+                                          GW_TIME_SYNC_TASK_PRIORITY,
+                                          s_worker_task_stack,
+                                          &s_worker_task_buffer);
+        if (s_worker_task == NULL) {
             time_network_set_error(ESP_ERR_NO_MEM);
             return ESP_ERR_NO_MEM;
         }

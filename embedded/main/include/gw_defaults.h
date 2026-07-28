@@ -73,16 +73,26 @@ extern "C" {
 #define GW_4G_PIN_RESET                       11
 #define GW_4G_PIN_DETECT                      38
 #define GW_4G_WAIT_USB_TIMEOUT_MS             30000U
+#define GW_4G_ECM_USB_REENUM_TIMEOUT_MS       35000U
 #define GW_4G_WAIT_IP_TIMEOUT_MS              45000U
 #define GW_4G_POWER_ON_DELAY_MS               3000U
+/* 4G 失败恢复时的断电、硬复位和 USB 栈释放参数。 */
+#define GW_4G_POWER_OFF_SETTLE_MS             5000U
+#define GW_4G_RESET_PULSE_MS                  200U
 #define GW_4G_RESET_DELAY_MS                  5000U
+#define GW_4G_HARD_RESET_AFTER_FAILURES       2U
+#define GW_4G_USB_TEARDOWN_RETRIES            3U
 #define GW_4G_USB_HOST_RELEASE_MS             3000U
 #define GW_4G_USB_HOST_POLL_MS                20U
 #define GW_4G_CDC_TASK_STACK_BYTES            (12U * 1024U)
 #define GW_4G_CDC_TASK_PRIORITY               9U
 #define GW_4G_CDC_RX_BUFFER_BYTES             (32U * 1024U)
 #define GW_4G_CDC_TX_BUFFER_BYTES             (16U * 1024U)
-#define GW_4G_CDC_TRANSFER_BUFFER_BYTES       (4U * 1024U)
+/*
+ * AT 通道单次响应受下方 512 字节缓冲限制，1 KiB USB transfer 已覆盖两个
+ * full-speed bulk 包；大容量排队仍由 PSRAM 中的 RX/TX ringbuffer 承担。
+ */
+#define GW_4G_CDC_TRANSFER_BUFFER_BYTES       (1U * 1024U)
 #define GW_4G_AT_RESPONSE_BUFFER_BYTES        512U
 #define GW_4G_AT_READ_TIMEOUT_MS              30U
 

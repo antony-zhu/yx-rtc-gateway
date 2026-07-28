@@ -73,6 +73,9 @@ typedef struct {
      *
      * @param[in] port_handle Handle to the CDC port that was opened
      * @param[in] user_data User data pointer that was passed during callback registration
+     *
+     * @note 回调在端口关闭互斥区内同步执行，不得在回调中再次调用 CDC API。
+     *       user_data 必须至少保持有效到 usbh_cdc_port_close() 返回。
      */
     void (*closed)(usbh_cdc_port_handle_t port_handle, void *user_data);
 
@@ -257,6 +260,9 @@ esp_err_t usbh_cdc_send_custom_request(usbh_cdc_port_handle_t cdc_port_handle, u
  * @param[in] length Pointer to the length of data to write. On success, it remains unchanged, otherwise set to 0.
  * @param[in] ticks_to_wait The maximum amount of time to wait for the write operation to complete
  *
+ * @note 必须使用有限超时，不得传入 portMAX_DELAY。设备断开时关闭流程会等待当前
+ *       I/O 退出，有限超时用于保证 DEV_GONE 可以及时完成资源回收。
+ *
  * @return
  *     - ESP_OK: Data written successfully
  *     - ESP_ERR_INVALID_ARG: Invalid argument (NULL handle, buffer, or length)
@@ -279,6 +285,8 @@ esp_err_t usbh_cdc_write_bytes(usbh_cdc_port_handle_t cdc_port_handle, const uin
  * @param[in] ticks_to_wait The maximum amount of time to wait for the read operation to complete
  *
  * @note If the port is not opened with ring buffer, the length must be equal to the internal transfer buffer size, otherwise the function will return ESP_ERR_INVALID_ARG.
+ * @note 必须使用有限超时，不得传入 portMAX_DELAY；需要持续等待时应由调用者使用
+ *       有限超时循环，并在每轮检查设备连接状态。
  *
  * @return
  *     - ESP_OK: Data read successfully

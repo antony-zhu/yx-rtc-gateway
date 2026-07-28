@@ -25,6 +25,7 @@ static const char *TAG = "iot_usbh_ecm";
 #define ECM_DEV_CONNECTED (1 << 0)
 #define ECM_STOP (1 << 4)
 #define ECM_STOP_DONE (1 << 5)
+#define ECM_STOP_TIMEOUT_MS 3000
 
 #define ECM_EVENT_ALL (ECM_DEV_CONNECTED | ECM_STOP | ECM_STOP_DONE)
 
@@ -45,6 +46,7 @@ typedef struct {
     EventGroupHandle_t event_group;
     uint8_t cdc_dev_addr;
     usbh_cdc_port_handle_t cdc_port;
+    esp_err_t last_connect_error;
     // const usb_device_desc_t *device_desc;
     bool dev_connect_status;
     uint8_t eth_mac_str_index;
@@ -190,6 +192,18 @@ static void _usbh_ecm_notif_cb(usbh_cdc_port_handle_t cdc_port_handle, iot_cdc_n
     }
 }
 
+/** 手动恢复关闭 CDC 端口时同步清除 ECM 内部的悬空句柄。 */
+static void _usbh_ecm_port_closed_cb(usbh_cdc_port_handle_t cdc_port_handle, void *arg)
+{
+    usbh_ecm_t *ecm = (usbh_ecm_t *)arg;
+
+    if (ecm != NULL && ecm->cdc_port == cdc_port_handle) {
+        ecm->cdc_port = NULL;
+        ecm->cdc_dev_addr = 0;
+        ecm->dev_connect_status = 0;
+    }
+}
+
 static void _usbh_ecm_dev_event_cb(usbh_cdc_device_event_t event, usbh_cdc_device_event_data_t *event_data, void *user_ctx)
 {
     switch (event) {
@@ -205,12 +219,20 @@ static void _usbh_ecm_dev_event_cb(usbh_cdc_device_event_t event, usbh_cdc_devic
         int itf_num = -1;
         esp_err_t ret = usbh_ecm_interface_check(device_desc, config_desc, &itf_num);
         if (ret != ESP_OK) {
+            ecm->last_connect_error = ret;
             ESP_LOGW(TAG, "No ECM interface found for device VID: %04X, PID: %04X, ignore it", device_desc->idVendor, device_desc->idProduct);
             return;
         }
         ESP_LOGI(TAG, "ECM interface found: VID: %04X, PID: %04X, IFNUM: %d", device_desc->idVendor, device_desc->idProduct, itf_num);
         const usb_ecm_function_desc_t *ecm_func_desc = NULL;
-        ESP_RETURN_VOID_ON_ERROR(usbh_get_ecm_function_desc(device_desc, config_desc, &ecm_func_desc), TAG, "Failed to check ECM function descriptor: %s", esp_err_to_name(err_rc_));
+        ret = usbh_get_ecm_function_desc(device_desc, config_desc, &ecm_func_desc);
+        if (ret != ESP_OK) {
+            ecm->last_connect_error = ret;
+            ESP_LOGE(TAG,
+                     "Failed to check ECM function descriptor: %s",
+                     esp_err_to_name(ret));
+            return;
+        }
         ecm->eth_mac_str_index = ecm_func_desc->iMACAddress;
 
         ecm->itf_num = itf_num;
@@ -222,14 +244,21 @@ static void _usbh_ecm_dev_event_cb(usbh_cdc_device_event_t event, usbh_cdc_devic
             .cbs = {
                 .notif_cb = _usbh_ecm_notif_cb,
                 .recv_data = _usbh_ecm_recv_data_cb,
+                .closed = _usbh_ecm_port_closed_cb,
                 .user_data = ecm,
             },
 #ifdef CONFIG_ECM_DISABLE_CDC_NOTIFICATION
             .flags = USBH_CDC_FLAGS_DISABLE_NOTIFICATION,
 #endif
         };
-        ESP_RETURN_VOID_ON_ERROR(usbh_cdc_port_open(&cdc_port_config, &ecm->cdc_port), TAG, "Failed to open CDC port");
+        ret = usbh_cdc_port_open(&cdc_port_config, &ecm->cdc_port);
+        if (ret != ESP_OK) {
+            ecm->last_connect_error = ret;
+            ESP_LOGE(TAG, "Failed to open CDC port: %s", esp_err_to_name(ret));
+            return;
+        }
 
+        ecm->last_connect_error = ESP_OK;
         ecm->cdc_dev_addr = event_data->new_dev.dev_addr;
         ecm->dev_connect_status = 1;
         ecm->last_connected = -1;
@@ -244,7 +273,10 @@ static void _usbh_ecm_dev_event_cb(usbh_cdc_device_event_t event, usbh_cdc_devic
         if (ecm->cdc_dev_addr == event_data->dev_gone.dev_addr) {
             ecm->cdc_dev_addr = 0;
             ecm->dev_connect_status = 0;
-            ecm->cdc_port = NULL;
+            /*
+             * 端口句柄只能由同步 closed 回调清除。提前置空会让销毁任务跳过
+             * port_close 等待并释放 ecm，随后 closed 回调访问 user_data 时 UAF。
+             */
             memset(ecm->eth_mac_addr, 0, 6);
             iot_eth_link_t link = IOT_ETH_LINK_DOWN;
             ecm->mediator->on_stage_changed(ecm->mediator, IOT_ETH_STAGE_LINK, &link);
@@ -328,7 +360,16 @@ esp_err_t usbh_ecm_deinit(iot_eth_driver_t *handle)
     usbh_ecm_t *ecm = __containerof(handle, usbh_ecm_t, base);
 
     xEventGroupSetBits(ecm->event_group, ECM_STOP);
-    xEventGroupWaitBits(ecm->event_group, ECM_STOP_DONE, pdTRUE, pdFALSE, portMAX_DELAY);
+    EventBits_t stop_bits =
+        xEventGroupWaitBits(ecm->event_group,
+                            ECM_STOP_DONE,
+                            pdFALSE,
+                            pdFALSE,
+                            pdMS_TO_TICKS(ECM_STOP_TIMEOUT_MS));
+    ESP_RETURN_ON_FALSE((stop_bits & ECM_STOP_DONE) != 0U,
+                        ESP_ERR_TIMEOUT,
+                        TAG,
+                        "USB ECM task stop timed out");
 
     ret = usbh_cdc_unregister_dev_event_cb(_usbh_ecm_dev_event_cb);
     ESP_RETURN_ON_ERROR(ret, TAG, "Failed to unregister CDC device event callback");
@@ -382,4 +423,11 @@ usbh_cdc_port_handle_t usb_ecm_get_cdc_port_handle(const iot_eth_driver_t *ecm_d
     ESP_RETURN_ON_FALSE(ecm_drv != NULL, NULL, TAG, "ecm is NULL");
     usbh_ecm_t *ecm = __containerof(ecm_drv, usbh_ecm_t, base);
     return ecm->cdc_port;
+}
+
+esp_err_t usb_ecm_get_last_connect_error(const iot_eth_driver_t *ecm_drv)
+{
+    ESP_RETURN_ON_FALSE(ecm_drv != NULL, ESP_ERR_INVALID_ARG, TAG, "ecm is NULL");
+    const usbh_ecm_t *ecm = __containerof(ecm_drv, usbh_ecm_t, base);
+    return ecm->last_connect_error;
 }
