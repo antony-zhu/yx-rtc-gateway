@@ -5,6 +5,9 @@
 /app/.dart_tool/
 /app/android/.gradle/
 /embedded/build/
+/embedded/build-*/
+/embedded/build-4g/
+/embedded/build-ethernet/
 **/__pycache__/
 *.py[cod]
 

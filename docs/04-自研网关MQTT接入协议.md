@@ -2,7 +2,7 @@
 
 ## 1. 文档说明
 
-本文档定义自研网关与设备管理平台之间的 MQTT 主题、通用报文、设备状态、设备属性、配置下发、方法调用、日志与 OTA 升级协议。出厂 MQTT 连接信息写入规则独立成文；网络和 HTTP 通用实现边界见 `14-模块设计-网络与HTTP.md`。状态、属性、诊断字段、错误码和 `reason_code` 查表以 `17-设备状态属性与错误码字典.md` 为准。
+本文档定义自研网关与设备管理平台之间的 MQTT 主题、通用报文、设备状态、设备属性、配置下发、方法调用、日志与 OTA 升级协议。统一 `dev_mqtt` 的 HTTPS 注册和兼容 NVS 字段规则独立成文；网络和 HTTP 通用实现边界见 `14-模块设计-网络与HTTP.md`。状态、属性、诊断字段、错误码和 `reason_code` 查表以 `17-设备状态属性与错误码字典.md` 为准。
 
 ### 1.1 协议版本
 
@@ -12,10 +12,11 @@
 | 字符编码 | UTF-8 |
 | 报文格式 | JSON |
 | 时间戳单位 | 毫秒，13 位 Unix 时间戳 |
-| MQTT QoS | 默认 QoS 1，可配置 |
+| MQTT 发布 QoS | 固定 QoS 0 |
+| MQTT 订阅 QoS | 固定 QoS 1 |
 | MQTT Clean Session | 默认 `1`，可配置 |
 | MQTT Retain | 默认 `0`，可配置 |
-| MQTT Last Will | 设备管理通道默认启用，用于异常离线通知 |
+| MQTT Last Will | 设备管理通道不启用 |
 
 ### 1.2 默认参数
 
@@ -23,10 +24,12 @@
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `mqtt.qos` | 1 | MQTT 默认 QoS |
+| `mqtt.qos` | 0 | 统一 `dev_mqtt` 发布 QoS；固定不可配置 |
+| `mqtt.publish_qos` | 0 | 统一 `dev_mqtt` 发布 QoS；固定不可配置 |
+| `mqtt.subscribe_qos` | 1 | 统一 `dev_mqtt` 订阅 QoS；固定不可配置 |
 | `mqtt.clean_session` | 1 | MQTT 默认 Clean Session |
 | `mqtt.retain` | 0 | MQTT 默认 Retain |
-| `mqtt.last_will_enabled` | true | 设备管理 MQTT 默认启用 Last Will |
+| `mqtt.last_will_enabled` | false | 统一 `dev_mqtt` 不启用 Last Will |
 | `mqtt.offline_cache_enabled` | false | 默认不缓存离线 MQTT 上报 |
 | `mqtt.max_payload_size` | 8192 | 单条 MQTT Payload 最大字节数 |
 | `mqtt.request_id_cache_size` | 32 | 最近 `request_id` 去重记录数量 |
@@ -55,6 +58,10 @@
 
 MQTT 重连建议使用退避策略：首次失败等待 `mqtt.reconnect_sec`，连续失败后逐步增加，但不超过 `mqtt.reconnect_max_sec`。HTTP/HTTPS 操作只定义连接超时和应答间隔超时，不定义总超时。
 
+生产固件只创建一条名为 `dev_mqtt` 的 MQTT 会话，同时承载设备管理 JSON 和 Dongle 原始二进制；
+协议、OTA、配置、状态/属性上报与 CH37X 桥接均复用该会话。注册请求固定使用
+`groupId=GID_yx_gw`，Topic 分组固定为 `yx_gw`，`device_id` 固定为 ESP32 eFuse MAC 的 12 位大写十六进制文本。
+
 设备发送或接收的单条 MQTT Payload 不得超过 `mqtt.max_payload_size`，默认 8192 字节。超过该限制的数据必须改用 HTTP 上传/下载，或在协议明确允许的场景下分片发送。
 
 ### 1.3 命名约定
@@ -63,8 +70,8 @@ MQTT 重连建议使用退避策略：首次失败等待 `mqtt.reconnect_sec`，
 - JSON 字段统一使用 `snake_case`。
 - `request_id` 用于请求与应答匹配，由请求方生成，建议不超过 64 字节。
 - 设备侧保存最近 32 个平台下发请求的 `request_id`；运行中任务的 `request_id` 永远不能重复，已完成记录 1 小时没有新数据后自动清理。设备对同一请求的分片应答、进度上报和最终应答可以复用同一个 `request_id`。
-- 出厂 MQTT 连接信息写入规则详见《出厂 MQTT 连接信息写入说明》。
-- 网络启动、HTTP 通用封装、HTTPS 证书、脚本 HTTP 边界详见 `14-模块设计-网络与HTTP.md`。
+- 统一 `dev_mqtt` 的 HTTPS 注册、身份和兼容 NVS 字段规则详见《出厂 MQTT 连接信息写入说明》。
+- 网络启动、HTTP 通用封装和 HTTPS 证书策略详见 `14-模块设计-网络与HTTP.md`；脚本 HTTP 章节仅供历史追溯。
 
 ### 1.4 通用报文结构
 
@@ -170,7 +177,7 @@ MQTT 重连建议使用退避策略：首次失败等待 `mqtt.reconnect_sec`，
 
 ## 2. 设备接入前提
 
-MQTT 连接信息必须在出厂/产测阶段写入设备 NVS，字段和异常处理见 `03-出厂MQTT连接信息写入说明.md`。固件运行时不执行 HTTP 注册，不通过 HTTP 接口自动获取 MQTT 账号密码。
+生产固件启动时由统一 `dev_mqtt` worker 按 `03-出厂MQTT连接信息写入说明.md` 执行 HTTPS 注册并获取 MQTT 连接参数；生产路径不依赖预置 MQTT 密码。旧版 NVS MQTT 字段仅作为兼容/自检数据保留，不创建第二条生产 MQTT 连接。
 
 本文档只定义私有网关协议的 JSON 报文结构、方法名、字段、Topic 语义和业务流程。
 
@@ -186,7 +193,7 @@ Topic 基础路径：
 
 | 变量 | 说明 |
 | --- | --- |
-| group_id | MQTT Topic 组 ID，当前联调阶段暂时固定使用 `yx_gw` |
+| group_id | MQTT Topic 组 ID，固定使用 `yx_gw` |
 | mac | 硬件 MAC，十六进制大写字符串；设备初始化时使用该值作为初始 `device_id` |
 | device_id | MQTT Topic 设备节点 ID；设备初始化时取硬件 MAC 十六进制大写字符串，Topic 中固定拼接为 `YxzhNode${device_id}` |
 
@@ -201,20 +208,20 @@ Topic 基础路径：
 | Topic | 方向 | 用途 |
 | --- | --- | --- |
 | `/yx_gw/YxzhNode${device_id}/thing/model/down_raw` | 服务器 -> 设备 | 所有设备管理协议下行请求 |
-| `/yx_gw/YxzhNode${device_id}/thing/model/up_raw` | 设备 -> 服务器 | 所有设备管理协议应答、状态、属性、进度、日志和脚本异常上报 |
+| `/yx_gw/YxzhNode${device_id}/thing/model/up_raw` | 设备 -> 服务器 | 所有设备管理协议应答、状态、属性、进度、日志和 Dongle 原始帧上报 |
 
-服务端必须为出厂写入设备的 MQTT 凭据放开上述 raw Topic 的下行订阅和上行发布权限。设备侧以 Broker `SUBACK` 作为订阅成功依据；如果 CONNECT 成功但订阅下行 Topic 时被服务端断开，视为服务端 Topic/ACL 与本协议不一致。
+服务端必须为 HTTPS 注册返回的 MQTT 凭据放开上述 raw Topic 的下行订阅和上行发布权限。设备侧以 Broker `SUBACK` 作为订阅成功依据；如果 CONNECT 成功但订阅下行 Topic 时被服务端断开，视为服务端 Topic/ACL 与本协议不一致。
 
 ## 4. 设备登录流程
 
-1. 设备启动后读取出厂写入的 MQTT 连接参数。
-2. 设备使用 `client_id`、`username`、`password` 登录 MQTT Broker。
+1. 网络就绪后，设备使用 eFuse MAC 和 `groupId=GID_yx_gw` 调用 HTTPS 注册接口。
+2. 设备使用注册响应返回的 `client_id`、`username`、`password` 登录 MQTT Broker。
 3. 设备订阅下行主题：`/yx_gw/YxzhNode${device_id}/thing/model/down_raw`。
 4. 设备上线后立即上报一次 `device.login.report`，随后上报一次 `heartbeat.report` 和完整 `property.report`。登录/心跳状态包含在线状态、当前联网方式和运行时长；基础属性包含固件版本、配置流水号、内存和存储状态。
 5. 服务器根据设备属性判断是否需要下发配置更新或 OTA 升级。
 6. 设备按心跳配置周期通过 `heartbeat.report` 上报在线状态。
 
-设备管理 MQTT Last Will 默认启用。Broker 在设备异常断线、保活超时或链路被动断开时向 `up_raw` 代发 `device.offline.report`，内容表示 `status=offline`；设备主动重连成功后会重新发送 `device.login.report`。
+统一 `dev_mqtt` 不启用 MQTT Last Will。设备主动重连成功后会重新发送 `device.login.report`；异常离线状态由设备下一次上线后的状态上报反映。
 
 ### 4.1 登录上报
 
@@ -234,7 +241,6 @@ Topic：
     "status": "online",
     "network_status": "connected",
     "mqtt_status": "connected",
-    "script_status": "running",
     "task_status": "idle",
     "boot_uptime_sec": 12,
     "online_uptime_sec": 0,
@@ -245,7 +251,7 @@ Topic：
 }
 ```
 
-### 4.2 离线遗嘱
+### 4.2 历史离线遗嘱（当前固件不启用）
 
 Topic：
 
@@ -267,6 +273,8 @@ Topic：
   }
 }
 ```
+
+> 说明：当前统一 `dev_mqtt` 不启用 Last Will，因此不会自动生成该报文；此示例仅用于兼容历史平台字段。
 
 ## 5. 设备心跳配置
 
@@ -312,10 +320,6 @@ Topic：
             "ota_checking",
             "ota_upgrading",
             "degraded",
-            "script_starting",
-            "script_running",
-            "script_stopped",
-            "script_error",
             "busy",
             "factory_resetting",
             "rebooting"
@@ -330,16 +334,12 @@ Topic：
           "type": "string",
           "description": "设备管理 MQTT 状态"
         },
-        "script_status": {
-          "type": "string",
-          "description": "Python 脚本状态"
-        },
         "task_status": {
           "type": "string",
           "description": "当前任务状态"
         }
       },
-      "required": ["device_id", "timestamp", "status", "network_status", "mqtt_status", "script_status", "task_status"],
+      "required": ["device_id", "timestamp", "status", "network_status", "mqtt_status", "task_status"],
       "additionalProperties": true
     }
   }
@@ -395,7 +395,6 @@ Topic：
     "status": "online",
     "network_status": "connected",
     "mqtt_status": "connected",
-    "script_status": "running",
     "task_status": "idle",
     "boot_uptime_sec": 3602,
     "online_uptime_sec": 3600,
@@ -410,7 +409,7 @@ Topic：
 
 ## 6. 设备状态
 
-设备上线、异常离线和心跳等运行状态统一通过 `up_raw` 中的 `device.login.report`、`device.offline.report` 和 `heartbeat.report` 上报，不放入设备属性。属性用于描述设备配置、版本、网络参数和资源信息；状态用于描述设备当前是否在线以及当前运行情况。
+设备上线和心跳等运行状态统一通过 `up_raw` 中的 `device.login.report` 和 `heartbeat.report` 上报，不放入设备属性；`device.offline.report` 仅为历史 Last Will 兼容字段。属性用于描述设备配置、版本、网络参数和资源信息；状态用于描述设备当前是否在线以及当前运行情况。
 
 Topic：
 
@@ -426,7 +425,6 @@ Topic：
 | status | string | 是 | 设备当前主状态，取值见下方状态枚举 |
 | network_status | string | 是 | 网络状态，取值见下方分状态枚举 |
 | mqtt_status | string | 是 | 设备管理 MQTT 状态，取值见下方分状态枚举 |
-| script_status | string | 是 | Python 脚本状态，取值见下方分状态枚举 |
 | task_status | string | 是 | 当前设备管理任务状态，取值见下方分状态枚举 |
 | boot_uptime_sec | integer | 否 | 本次启动时长，单位秒 |
 | online_uptime_sec | integer | 否 | 当前在线时长，单位秒 |
@@ -443,7 +441,6 @@ Topic：
 | health_status | string | 否 | 健康状态摘要，取值 `ok`、`warn`、`degraded`、`fatal_pending` |
 | last_fault_module | string | 否 | 最近故障模块 |
 | last_fault_reason | string | 否 | 最近故障原因 |
-| script_disabled_by_fault | boolean | 否 | 是否因脚本异常重启风暴临时禁用脚本自动运行 |
 
 状态枚举：
 
@@ -457,10 +454,6 @@ Topic：
 | `ota_checking` | 正在检查 OTA |
 | `ota_upgrading` | 正在 OTA 升级 |
 | `degraded` | 受限运行，仍保留设备管理能力 |
-| `script_starting` | Python 脚本启动中 |
-| `script_running` | Python 脚本运行中 |
-| `script_stopped` | Python 脚本已停止 |
-| `script_error` | Python 脚本异常 |
 | `busy` | 设备正在执行互斥操作 |
 | `factory_resetting` | 正在恢复出厂 |
 | `rebooting` | 即将重启或正在重启 |
@@ -474,17 +467,11 @@ Topic：
 | `network_status` | `connected` | 网络已连接 |
 | `network_status` | `degraded` | 网络已连接但质量差或不稳定 |
 | `mqtt_status` | `disconnected` | `dev_mqtt` 未连接 |
-| `mqtt_status` | `not_configured` | 出厂 MQTT 连接信息缺失或损坏 |
+| `mqtt_status` | `not_configured` | HTTPS 注册尚未成功或兼容凭据缺失/损坏 |
 | `mqtt_status` | `connecting` | `dev_mqtt` 正在连接 |
 | `mqtt_status` | `connected` | `dev_mqtt` 已连接 |
 | `mqtt_status` | `reconnecting` | `dev_mqtt` 正在重连 |
 | `mqtt_status` | `auth_failed` | `dev_mqtt` 鉴权失败 |
-| `script_status` | `disabled` | 脚本被配置禁用 |
-| `script_status` | `disabled_by_fault` | 因脚本异常重启风暴临时禁用 |
-| `script_status` | `starting` | 脚本启动中 |
-| `script_status` | `running` | 脚本运行中 |
-| `script_status` | `stopped` | 脚本已停止 |
-| `script_status` | `error` | 脚本异常 |
 | `task_status` | `idle` | 当前无设备管理任务 |
 | `task_status` | `busy` | 正在执行互斥任务 |
 | `task_status` | `config_checking` | 正在检查配置 |
@@ -532,10 +519,12 @@ Topic：
       "heartbeat_enabled": true,
       "heartbeat_interval_sec": 60,
       "heartbeat_min_interval_sec": 10,
-      "qos": 1,
+      "qos": 0,
+      "publish_qos": 0,
+      "subscribe_qos": 1,
       "clean_session": 1,
       "retain": 0,
-      "last_will_enabled": true,
+      "last_will_enabled": false,
       "offline_cache_enabled": false,
       "max_payload_size": 8192,
       "keep_alive_sec": 60,
@@ -575,10 +564,6 @@ Topic：
       "scan_interval_sec": 86400,
       "mqtt_direct_max_size": 8192
     },
-    "script": {
-      "exception_action": "restart_by_watchdog",
-      "stop_timeout_ms": 5000
-    },
     "memory": {
       "total": 8388608,
       "used": 1048576,
@@ -608,7 +593,7 @@ Topic：
 | 属性路径 | 类型 | 说明 | 取值或备注 |
 | --- | --- | --- | --- |
 | mac | string | 设备 MAC 地址 | 建议大写十六进制字符串 |
-| device_id | string | 设备唯一标识 | 建议不超过 64 字节 |
+| device_id | string | 设备唯一标识 | 固定为 ESP32 eFuse MAC 的 12 位大写十六进制文本 |
 | product_id | string | 产品 ID | 出厂写入 NVS，当前默认 `yx_gw` |
 | device_model | string | 设备固定型号 | 当前固定 `ESP32S3R8N16` |
 | mcu_product_id | string | 主控模组型号 | 当前固定 `ESP32S3R8N16` |
@@ -616,7 +601,7 @@ Topic：
 | firmware_version | string | 固件版本号 | 固件内部按 3 字节 `major.minor.patch` 表示，JSON 中显示为字符串，例如 `1.0.0` |
 | reboot_times | integer | 累计重启次数 | 单调递增 |
 | reboot_code | integer | 最近一次重启代码 | 由固件定义 |
-| reboot_reason | string | 最近一次重启原因 | `unknown`、`script_exception`、`network_error`、`server_reboot`、`ota_done` |
+| reboot_reason | string | 最近一次重启原因 | `unknown`、`network_error`、`server_reboot`、`ota_done`；`script_exception` 仅为历史值 |
 | wifi.ssid | string | Wi-Fi 名称 | 仅当前联网方式为 `wifi` 时有效 |
 | wifi.password | string | Wi-Fi 密码 | 敏感字段，默认不上报；确需下发时应加密或脱敏 |
 | 4g.imei | string | 4G 模块 IMEI | 仅当前联网方式为 `4g` 时有效 |
@@ -646,10 +631,12 @@ Topic：
 | mqtt.heartbeat_interval_sec | integer | MQTT 心跳间隔 | 单位秒，默认 60 |
 | mqtt.heartbeat_min_interval_sec | integer | MQTT 最小心跳间隔 | 单位秒，默认 10 |
 | mqtt.broker | string | MQTT Broker 地址 | 格式：`mqtt[s]://host:port` |
-| mqtt.qos | integer | MQTT 默认 QoS | 默认 1 |
+| mqtt.qos | integer | 统一 `dev_mqtt` 发布 QoS | 固定 0 |
+| mqtt.publish_qos | integer | 统一 `dev_mqtt` 发布 QoS | 固定 0 |
+| mqtt.subscribe_qos | integer | 统一 `dev_mqtt` 订阅 QoS | 固定 1 |
 | mqtt.clean_session | integer | MQTT Clean Session | 默认 1 |
 | mqtt.retain | integer | MQTT Retain | 默认 0 |
-| mqtt.last_will_enabled | boolean | MQTT Last Will 使能 | 默认 true；异常离线时由 Broker 代发 `device.offline.report` |
+| mqtt.last_will_enabled | boolean | MQTT Last Will 使能 | 固定 false；统一 `dev_mqtt` 不启用 Last Will |
 | mqtt.offline_cache_enabled | boolean | 离线上报缓存使能 | 默认 false；当前设备管理侧不缓存 |
 | mqtt.max_payload_size | integer | MQTT 单条 Payload 最大长度 | 单位字节，默认 8192 |
 | mqtt.request_id_cache_size | integer | `request_id` 去重记录数量 | 默认 32 |
@@ -681,9 +668,6 @@ Topic：
 | log.clean_high_watermark_percent | integer | 日志清理触发使用率 | 默认 80 |
 | log.clean_target_percent | integer | 日志清理目标使用率 | 默认 50 |
 | log.mqtt_direct_max_size | integer | 日志 MQTT 直传最大 Payload | 单位字节，固定 8192 |
-| script.exception_action | string | 脚本异常处理策略 | `restart_immediately`、`restart_by_watchdog`、`ignore`，默认 `restart_by_watchdog` |
-| script.stop_timeout_ms | integer | 系统任务停止脚本的最长等待时间 | 单位毫秒，固定 5000 |
-| script.last_exception | string | 最近一次脚本异常摘要 | 最大 1024 字节，超出截断 |
 | memory.total | integer | 设备总可用内存 | 单位字节，统计口径由固件统一换算，不区分 PSRAM、内部 RAM 等平台差异 |
 | memory.used | integer | 当前已用内存 | 单位字节 |
 | memory.free | integer | 当前剩余内存 | 单位字节 |
@@ -702,58 +686,16 @@ Topic：
 
 ## 8. 用户配置
 
-用户配置采用整包文件更新方式，与 OTA 的下载、校验、应用流程保持一致。配置包固定包含 `manifest.jsonl`、`config.json` 和 `main.py`，其中 `manifest.jsonl` 描述配置流水号和包内文件。设备通过 `config.sequence` 和 `config.manifest_sha256` 上报当前配置状态，服务器据此判断是否需要下发更新。
+用户配置采用整包文件更新方式，与 OTA 的下载、校验、应用流程保持一致。当前 C 固件配置包只包含
+`manifest.jsonl` 和 `config.json` 等配置文件，不再包含或执行 `main.py`。其中 `manifest.jsonl`
+描述配置流水号和包内文件。设备通过 `config.sequence` 和 `config.manifest_sha256` 上报当前配置状态，
+服务器据此判断是否需要下发更新。
 
-### 8.1 脚本异常处理配置
+### 8.1 历史脚本配置兼容说明
 
-Topic：
-
-```text
-/yx_gw/YxzhNode${device_id}/thing/model/down_raw
-```
-
-```json
-{
-  "version": "v1.0",
-  "method": "script.config",
-  "request_id": "script-cfg-001",
-  "timestamp": 1703424234214,
-  "data": {
-    "exception_action": "restart_by_watchdog"
-  }
-}
-```
-
-| 字段名 | 类型 | 说明 |
-| --- | --- | --- |
-| exception_action | string | 脚本异常后的处理方式 |
-
-`exception_action` 取值：
-
-| 取值 | 说明 |
-| --- | --- |
-| restart_immediately | 立即重启 |
-| restart_by_watchdog | 等待看门狗重启，默认值 |
-| ignore | 不做任何操作，仅上报异常 |
-
-设备应答：
-
-```json
-{
-  "version": "v1.0",
-  "method": "script.config.reply",
-  "request_id": "script-cfg-001",
-  "timestamp": 1703424234300,
-  "code": 0,
-  "message": "ok",
-  "data": {
-    "applied_keys": ["script.exception_action"],
-    "exception_action": "restart_by_watchdog"
-  }
-}
-```
-
-`script.config` 写入系统 NVS，恢复出厂后回到默认 `restart_by_watchdog`。该配置只影响后续脚本异常处理，不表示远程启动、停止或重启脚本。
+当前固件已移除 MicroPython 和脚本运行时，不再接受 `script.config`、
+`script.exception_action` 或脚本启停请求。平台如向历史设备兼容入口发送这些方法，设备应返回
+`501/unsupported`；新配置包不得包含 `main.py` 或脚本异常策略字段。
 
 ### 8.2 配置文件更新
 
@@ -819,18 +761,18 @@ Topic：
 2. 服务器对比设备配置状态与目标配置状态。
 3. 如需更新，服务器通过 `config.update` 下发 `manifest_url`、`manifest_size` 和 `manifest_sha256`。
 4. 设备先判断 `sequence`，只有 `sequence > 当前 config.sequence` 才允许进入下载流程；否则拒绝更新，并使用同一 `request_id` 返回 `409` 和拒绝原因。
-5. 设备下载 `manifest.jsonl`，校验大小与 SHA-256，再根据 `manifest.jsonl` 下载并校验包内 `config.json` 和 `main.py`；文件 URL 默认以 `manifest_url` 所在目录为基准拼接。
+5. 设备下载 `manifest.jsonl`，校验大小与 SHA-256，再根据 `manifest.jsonl` 下载并校验包内 C 固件配置文件（例如 `config.json`）；文件 URL 默认以 `manifest_url` 所在目录为基准拼接。
 6. 校验通过后应用配置，并通过 `up_raw` 上报结果。
 7. 校验失败或应用失败时，设备保留旧配置并上报错误码与原因。
 
 配置包路径规则：
 
 1. `manifest.jsonl` 中的 `name` 为相对配置区根目录的文件路径。
-2. 当前版本固定要求包含 `config.json` 和 `main.py`。
+2. 当前 C 固件固定要求包含 `config.json` 等声明的配置文件，不包含 `main.py`。
 3. 允许使用子目录，但设备必须先对路径做规范化。
 4. 路径中允许出现 `../`，但规范化后的最终路径不得逃出当前配置区；逃出时拒绝该配置包并返回 `path_traversal`。
-5. `config.json` 不要求平台提供 JSON Schema，由用户脚本自行解释。
-6. 单个配置区最大使用量为 1.8 MB，包含 `manifest.jsonl`、`config.json`、`main.py` 和所有子目录文件；超过时拒绝配置包并返回 `storage_full`。
+5. `config.json` 由 C 配置模块校验和应用，不进入脚本运行时。
+6. 单个配置区最大使用量为 1.8 MB，包含 `manifest.jsonl`、`config.json` 和所有子目录文件；超过时拒绝配置包并返回 `storage_full`。
 
 ## 9. 设备方法
 
@@ -838,7 +780,7 @@ Topic：
 
 ### 9.0 指令并发与忙碌应答
 
-设备同一时间只允许一个非查询类指令执行。正在执行 OTA、配置更新、重启、恢复出厂、属性设置或脚本异常策略配置时，如果收到新的非查询类指令，设备必须拒绝并应答 `device_busy`。
+设备同一时间只允许一个非查询类指令执行。正在执行 OTA、配置更新、重启、恢复出厂或属性设置时，如果收到新的非查询类指令，设备必须拒绝并应答 `device_busy`。
 
 查询类指令允许并行执行，包括 `device.status.get`、`task.current.get`、`property.get`、`log.query` 和 `schema.get`。
 
@@ -907,7 +849,6 @@ Topic：
     "status": "online",
     "network_status": "connected",
     "mqtt_status": "connected",
-    "script_status": "running",
     "task_status": "idle",
     "boot_uptime_sec": 3602,
     "online_uptime_sec": 3600,
@@ -994,7 +935,7 @@ Topic：
 
 ### 9.4 恢复出厂
 
-`device.factory_reset` 允许平台远程触发恢复出厂。恢复出厂必须保留设备身份类信息，包括 `mac`、当前 `device_id` 和 `product_id`；`device_id` 不得被清除或重置回 MAC。MQTT 连接信息按恢复出厂策略清除，清除后必须由出厂/维护工具重新写入。
+`device.factory_reset` 允许平台远程触发恢复出厂。恢复出厂必须保留设备身份类信息，包括 `mac`、当前 `device_id` 和 `product_id`；当前规则下 `device_id` 继续使用 eFuse MAC。兼容 NVS MQTT 字段和运行参数按恢复出厂策略清除；重启后由统一 `dev_mqtt` worker 再次通过 HTTPS 注册，不需要人工写入生产凭据。
 
 请求必须携带 `confirm=true` 和非空 `reason`，否则设备拒绝执行。
 
@@ -1386,7 +1327,7 @@ HTTP POST 上传完成后的 MQTT 应答示例：
 | start_time | integer | 可选，查询起始时间，毫秒时间戳；设备未授时时可能无法按真实时间过滤 |
 | end_time | integer | 可选，查询结束时间，毫秒时间戳 |
 | level | array | 日志等级过滤，可选：`debug`、`info`、`warn`、`error`；为空表示不过滤 |
-| module | array | 模块过滤，例如 `mqtt`、`network`、`script`、`ota`、`config`；为空表示不过滤 |
+| module | array | 模块过滤，例如 `mqtt`、`network`、`ota`、`config`；为空表示不过滤 |
 | upload_url | string | HTTP POST 上传地址；当完整 MQTT 应答预计超过 8192 字节时必填 |
 | delivery | string | 日志返回方式：`mqtt` 或 `http_post` |
 | chunk_index | integer | MQTT 分片序号，从 1 开始；非分片时为 1 |
@@ -1449,10 +1390,6 @@ HTTP POST 上传完成后的 MQTT 应答示例：
             "ota_checking",
             "ota_upgrading",
             "degraded",
-            "script_starting",
-            "script_running",
-            "script_stopped",
-            "script_error",
             "busy",
             "factory_resetting",
             "rebooting"
@@ -1464,14 +1401,11 @@ HTTP POST 上传完成后的 MQTT 应答示例：
         "mqtt_status": {
           "type": "string"
         },
-        "script_status": {
-          "type": "string"
-        },
         "task_status": {
           "type": "string"
         }
       },
-      "required": ["device_id", "timestamp", "status", "network_status", "mqtt_status", "script_status", "task_status"],
+      "required": ["device_id", "timestamp", "status", "network_status", "mqtt_status", "task_status"],
       "additionalProperties": true
     }
   }
@@ -1515,7 +1449,7 @@ HTTP POST 上传完成后的 MQTT 应答示例：
     },
     "methods": {
       "schema": ["schema.get"],
-      "config": ["heartbeat.config", "script.config", "config.update"],
+      "config": ["heartbeat.config", "config.update"],
       "service": [
         "device.status.get",
         "task.current.get",
@@ -1526,7 +1460,7 @@ HTTP POST 上传完成后的 MQTT 应答示例：
         "log.query"
       ]
     },
-    "property_keys": ["mac", "device_id", "product_id"],
+    "property_keys": ["mac", "device_id", "product_id", "mqtt.publish_qos", "mqtt.subscribe_qos"],
     "settable_property_keys": ["mqtt.heartbeat_enabled", "mqtt.heartbeat_interval_sec"],
     "reserved_methods": ["schema.set", "device.factory_reset"]
   }
@@ -1555,7 +1489,7 @@ HTTP POST 上传完成后的 MQTT 应答示例：
 }
 ```
 
-## 11. 日志与脚本异常
+## 11. 日志与历史脚本异常
 
 ### 11.1 固件日志
 
@@ -1587,33 +1521,8 @@ Topic：
 
 Release 版本禁止通过本地日志或 MQTT 日志输出 MQTT 密码、HTTP URL 中的 token、出厂凭据、派生密钥、Wi-Fi 密码、用户配置中的密钥类字段，以及 NVS 加密密钥或中间派生密钥。确需在调试版本输出敏感字段时，必须先脱敏。
 
-### 11.2 脚本异常
+### 11.2 历史脚本异常（当前固件不适用）
 
-Topic：
-
-```text
-/yx_gw/YxzhNode${device_id}/thing/model/up_raw
-```
-
-```json
-{
-  "version": "v1.0",
-  "method": "script.exception",
-  "timestamp": 1703424234214,
-  "data": {
-    "script_name": "main.py",
-    "exception": "runtime error: nil value",
-    "stack": "main.py:12",
-    "truncated": false
-  }
-}
-```
-
-字段说明：
-
-| 字段名 | 类型 | 说明 |
-| --- | --- | --- |
-| script_name | string | 脚本名称 |
-| exception | string | 异常摘要，最大 1024 字节，超出截断 |
-| stack | string | 堆栈信息，可为空 |
-| truncated | boolean | 异常内容是否被截断 |
+早期协议版本曾定义 `script.exception` 上报。当前 C 固件已移除 MicroPython 和脚本运行时，
+不生成该报文，也不接受脚本异常策略；平台应以 `device.status.get`、`status.report` 和
+统一健康状态字段判断设备异常。

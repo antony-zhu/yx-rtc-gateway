@@ -11,8 +11,8 @@
 | 文档 | 说明 |
 | --- | --- |
 | `04-自研网关MQTT接入协议.md` | MQTT 协议正文 |
-| `07-模块设计-MQTT基础封装.md` | 通用 MQTT client 封装，供 `dev_mqtt` 和脚本 MQTT 复用 |
-| `05-模块设计-C与Python交互规则.md` | 脚本侧 MQTT 事件进入 Python 的通用桥接规则 |
+| `07-模块设计-MQTT基础封装.md` | 通用 MQTT client 封装，由统一 `dev_mqtt` 传输层复用 |
+| `05-模块设计-C与Python交互规则.md` | 历史设计文档；当前固件已移除 MicroPython，不参与构建和运行 |
 | `09-模块设计-设备管理主流程.md` | 线程 1 主流程和任务编排 |
 | `06-模块设计-存储与文件系统.md` | NVS、LittleFS、日志和配置存储 |
 | `03-出厂MQTT连接信息写入说明.md` | 出厂 MQTT 连接信息写入规则 |
@@ -23,36 +23,41 @@
 
 ## 2. 设计目标
 
-1. MQTT 连接层和协议处理层分离，连接层统一使用 `gw_mqtt_client` 封装。
-2. 所有平台下行统一经过 `gw_protocol_manager`。
+1. MQTT 连接层和协议处理层分离，生产传输统一由 `gw_business_mqtt` 管理，并在内部使用 `gw_mqtt_client` 封装。
+2. 管理类 JSON 下行统一经过 `gw_protocol_manager`；Dongle 原始二进制下行直接交给 CH37X 桥接层。
 3. 严格校验 Topic、Payload 大小、JSON、`version`、`method` 和 `request_id`。
 4. 统一维护最近 32 个平台 `request_id` 去重记录。
 5. 统一实现查询类和非查询类方法的并发规则。
 6. 非查询类方法同一时间只允许一个执行。
 7. 所有 MQTT 触发 HTTP 操作必须用同一个 `request_id` 返回最终结果。
 8. 协议处理模块不得在 MQTT 回调中执行长耗时操作。
-9. 协议处理模块不得直接写 Flash 大文件、执行 Python 代码或阻塞脚本线程。
+9. 协议处理模块不得直接写 Flash 大文件、启动脚本运行时或阻塞驱动线程。
 
 ## 3. 模块边界
 
 建议目录：
 
 ```text
-main/
+embedded/components/gw_app/
   gw/
     gw_protocol_manager.c
+    gw_mqtt_manager.c       # 兼容外壳，不创建第二条生产连接
     gw_state.c
   mqtt/
+    gw_business_mqtt.c      # 唯一 dev_mqtt 会话和上下行分流
+    gw_dongle_mqtt_bridge.c # CH37X/Dongle 原始帧桥接
     gw_mqtt_client.c
-    gw_mqtt_client.h
 ```
 
 职责划分：
 
 | 模块 | 职责 |
 | --- | --- |
-| `gw_mqtt_client` | 通用 MQTT 连接、订阅、发布、重连、事件和状态封装；同时供 `dev_mqtt` 和脚本 MQTT 使用 |
-| `gw_protocol_manager` | Topic 校验、JSON 解析、方法分发、应答、去重、互斥 |
+| `gw_mqtt_client` | 底层 MQTT 连接、订阅、发布、重连、事件和状态封装；不直接承载业务路由 |
+| `gw_business_mqtt` | 创建唯一 `dev_mqtt` 会话，固定 Topic/QoS，重组下行并将管理 JSON 与原始二进制分流 |
+| `gw_dongle_mqtt_bridge` | 通过 CH37X USB Host 收发 Dongle 原始帧，并复用统一 `dev_mqtt` 上行/下行队列 |
+| `gw_mqtt_manager` | 既有设备管理 API 的兼容外壳；生产路径转发到 `gw_business_mqtt`，不得再创建 client |
+| `gw_protocol_manager` | 管理 JSON 的 Topic 校验、解析、方法分发、应答、去重、互斥 |
 | `gw_state` | 状态和属性数据聚合 |
 | `gw_config_manager` | 配置类方法执行 |
 | `ota_manager` | OTA 类方法执行 |
@@ -70,26 +75,29 @@ main/
 
 ## 4. MQTT 连接参数
 
-设备管理 MQTT 连接名为 `dev_mqtt`。`dev_mqtt` 不是单独的一套底层 MQTT 实现，而是 `gw_mqtt_client` 通用封装层上的一个系统 client 实例。脚本侧 MQTT 也必须通过 `gw_mqtt_client` 创建脚本 client 实例，但不能访问 `dev_mqtt` 的凭据和句柄。
+生产固件只创建一条 MQTT 会话，client 名称和角色固定为 `dev_mqtt`。该会话同时承载设备管理 JSON 和 Dongle 原始二进制；`gw_mqtt_manager` 仅保留兼容 API，生产路径不会创建第二个 MQTT client。MicroPython 和脚本 MQTT 客户端已移除。
 
 默认参数：
 
 | 参数 | 默认值 |
 | --- | --- |
-| QoS | 1 |
+| 发布 QoS | 0 |
+| 订阅 QoS | 1 |
 | Clean Session | 1 |
 | Retain | 0 |
 | Last Will | 不启用 |
 | 离线缓存 | 不启用 |
-| 单条 Payload | 8192 字节 |
+| 管理 JSON Payload | 8192 字节；Dongle 原始下行帧最大 256 字节 |
 | 连接超时 | 10 秒 |
 
 说明：
 
-1. 协议处理模块发布消息时默认使用设备参数中的 QoS 和 retain。
+1. 统一 `dev_mqtt` 的所有业务上行固定使用 QoS 0、retain=0；下行订阅固定使用 QoS 1。
 2. 当前默认不缓存离线 MQTT 上报；`dev_mqtt` 离线时，协议上报直接失败或由上层按场景降级。
-3. Last Will 默认不启用；如配置启用，由 MQTT 连接模块发布 `status=offline` 到 `up_raw`。
-4. 脚本 MQTT 的连接参数、Topic 和回调由脚本 API 管理，不进入设备管理协议处理流程。
+3. Last Will 当前不启用；不再存在脚本 MQTT 的独立连接参数、Topic 或回调。
+4. `gw_mqtt_manager_publish_wait()` 只等待消息交给本地 ESP-MQTT outbox，不代表收到 Broker 的 PUBACK（统一上行是 QoS 0）。
+
+身份和分组固定为：注册请求使用 `GID_yx_gw`，Topic 分组使用 `yx_gw`，`device_id` 使用 ESP32 eFuse MAC 的 12 位大写十六进制文本。
 
 ## 5. Topic 路由
 
@@ -119,26 +127,31 @@ Topic 校验规则：
 4. Topic 解析失败不得触发业务逻辑。
 5. 出厂 MQTT 连接信息文档只定义连接参数写入，不定义这些 Topic。
 
+传输契约：
+
+| 方向 | 内容 | 处理入口 |
+| --- | --- | --- |
+| 下行 | JSON 管理报文 | `gw_business_mqtt_recv_management()` -> `gw_protocol_handle_down()` |
+| 下行 | 原始二进制 Dongle 帧 | `gw_business_mqtt_recv_raw()` -> `gw_dongle_mqtt_bridge` -> CH37X |
+| 上行 | 管理应答、状态、属性和 OTA | `gw_mqtt_manager` 兼容 API -> 统一 `up_raw`，QoS 0 |
+| 上行 | Dongle 原始二进制帧 | `gw_dongle_mqtt_bridge` -> 统一 `up_raw`，QoS 0 |
+
 ## 6. 下行处理流水线
 
-MQTT 下行处理顺序固定为：
+统一 `dev_mqtt` 的下行处理顺序固定为：
 
 ```text
-mqtt_worker 收包
-  -> 检查 Payload 长度
-  -> 投递 MQTT_DOWNLINK 事件
-  -> gw_protocol_manager 校验 Topic
-  -> 解析 JSON
-  -> 校验通用字段
-  -> request_id 去重
-  -> 判断查询/非查询
-  -> 分发到业务模块
-  -> 生成应答或进度
+dev_mqtt worker 收包
+  -> 检查 Topic 和 Payload 长度
+  -> 按 Payload 首个有效字节分流
+     -> JSON 管理报文 -> gw_protocol_manager 校验/解析
+        -> request_id 去重 -> 方法分发 -> 应答或进度
+     -> 原始二进制 -> gw_dongle_mqtt_bridge -> CH37X 写入
 ```
 
 要求：
 
-1. `mqtt_worker` 不直接执行方法。
+1. `dev_mqtt` worker 不直接执行管理方法，也不直接写 CH37X；只负责接收、重组和投递。
 2. `gw_protocol_manager` 单次处理应尽快返回。
 3. 配置下载、OTA 下载、日志 HTTP 上传等长耗时操作必须投递到 worker。
 4. 解析失败、字段缺失、方法不支持等错误必须尽量通过对应上行 Topic 应答。
@@ -146,10 +159,10 @@ mqtt_worker 收包
 
 ## 7. Payload 与 JSON 校验
 
-Payload 规则：
+管理 JSON Payload 规则：
 
-1. 单条 MQTT Payload 最大 8192 字节。
-2. 超过 8192 字节的下行直接拒绝。
+1. 单条管理 JSON MQTT Payload 最大 8192 字节；Dongle 原始二进制下行最大 256 字节。
+2. 超过对应上限的下行直接拒绝。
 3. 字符串按 UTF-8 解析。
 4. JSON 根对象必须是 object。
 5. 不允许在一个 MQTT Payload 中合并多个请求。
@@ -194,7 +207,7 @@ Payload 规则：
 | 属性 | `up_raw` |
 | OTA 进度 | `up_raw` |
 | 实时固件日志 | `up_raw` |
-| 脚本异常 | `up_raw` |
+| Dongle 原始上行帧 | `up_raw`（二进制，QoS 0） |
 
 ## 9. 方法分类
 
@@ -213,7 +226,6 @@ Payload 规则：
 | 方法 | 说明 |
 | --- | --- |
 | `heartbeat.config` | 配置心跳参数 |
-| `script.config` | 配置脚本异常处理策略 |
 | `config.update` | 整包配置更新 |
 | `schema.set` | 设置 Schema |
 | `property.set` | 设置属性 |
@@ -221,7 +233,7 @@ Payload 规则：
 | `device.reboot` | 设备重启 |
 | `device.factory_reset` | 恢复出厂 |
 
-当前版本不在 MQTT 协议中定义远程脚本启动、停止和重启方法。脚本停止和重启只作为配置更新、OTA、恢复出厂、系统重启和脚本异常策略中的内部协同动作。
+当前固件已移除 MicroPython 和脚本运行时，因此不再提供 `script.config`、`script.exception` 或任何脚本启停方法。配置更新、OTA、恢复出厂和重启只协调对应的 C worker 与驱动资源。
 
 当前固件已预留但尚未完整落地的方法必须返回 `501/unsupported`，不得占用互斥任务，也不得返回 `method_not_found`。当前保留方法包括 `schema.set` 和 `device.factory_reset`；平台应通过 `schema.get` 的 `reserved_methods` 识别这些能力。`ota.upgrade` 已落地为异步 OTA 任务。
 
@@ -309,7 +321,6 @@ Payload 规则：
 | 方法 | 分类 | 处理模块 | 说明 |
 | --- | --- | --- | --- |
 | `heartbeat.config` | 非查询 | `gw_state` / `gw_config_manager` | 应用心跳配置 |
-| `script.config` | 非查询 | `gw_script_manager` | 应用脚本异常处理策略，保存到系统 NVS |
 | `config.update` | 非查询 | `gw_config_manager` | 整包配置更新 |
 
 配置类方法要求：
@@ -317,7 +328,7 @@ Payload 规则：
 1. `config.update` 必须校验 `sequence` 递增。
 2. `config.update` 下载和校验失败时保留旧配置。
 3. `config.update` 成功后重启。
-4. `script.config` 只改变脚本异常策略，不表示远程启停脚本；当前支持 `restart_immediately`、`restart_by_watchdog` 和 `ignore`。
+4. 当前固件不接受脚本配置字段；收到历史 `script.config` 请求时应返回 `501/unsupported`（如进入协议兼容层）。
 
 ### 12.3 service 类方法
 
@@ -361,7 +372,8 @@ service 方法要求：
 7. HTTP 状态码非 2xx、服务端 `code != 200`、超时或网络错误均视为失败。
 8. 未收到 HTTP 响应时，MQTT 应答中的 `http_status` 填 0。
 
-固件不执行 HTTP 注册。MQTT 连接信息缺失时只更新本地状态和诊断，不进入 MQTT 应答流程。
+生产启动的 HTTPS 注册由统一 `dev_mqtt` worker 负责，不属于下行协议方法；注册尚未成功时
+设备保持离线并按退避策略重试，不生成 MQTT 协议应答。兼容 NVS 连接字段只供自检/维护路径使用。
 
 ## 14. 上行报文生成
 
@@ -440,7 +452,7 @@ service 方法要求：
 1. 校验 `sequence`、`manifest_url`、`manifest_sha256`、`manifest_size`。
 2. 校验 `sequence > 当前 config.sequence`。
 3. 占用互斥任务。
-4. 通知脚本停止或释放资源。
+4. 通知相关 C 应用 worker 停止或释放资源。
 5. 投递配置下载任务。
 6. 配置模块写入非生效区并校验。
 7. 切换 NVS 当前生效区。
@@ -455,7 +467,7 @@ service 方法要求：
 
 | 类型 | Topic | 说明 |
 | --- | --- | --- |
-| 状态 | `up_raw` / `status.report` | 在线、网络、MQTT、脚本、任务等实时状态 |
+| 状态 | `up_raw` / `status.report` | 在线、网络、统一 MQTT、Dongle、任务等实时状态 |
 | 属性 | `up_raw` / `property.report` | 固件版本、配置版本、网络参数、资源、存储等设备属性 |
 
 处理规则：
@@ -482,7 +494,7 @@ Release 版本禁止通过 MQTT 输出：
 
 1. 错误应答只返回必要原因码。
 2. 日志和异常上报应截断过长字段。
-3. `script.exception` 的 stack 最大长度按协议限制处理。
+3. 管理 JSON 字段和错误文本按协议限制处理；当前不存在脚本异常上报。
 4. `property.get` 不允许读取敏感字段明文。
 
 ## 20. 对外接口建议
@@ -495,6 +507,8 @@ Release 版本禁止通过 MQTT 输出：
 | `gw_protocol_validate_topic(topic, out_route)` | 校验并解析 Topic |
 | `gw_protocol_parse_message(payload, out_msg)` | 解析通用 JSON 报文 |
 | `gw_protocol_dispatch(route, msg)` | 分发到具体方法 |
+| `gw_business_mqtt_recv_management(out, timeout_ms)` | 从统一 `dev_mqtt` 领取管理 JSON |
+| `gw_business_mqtt_recv_raw(out, timeout_ms)` | 从统一 `dev_mqtt` 领取 Dongle 原始二进制 |
 
 ### 20.2 应答与发布
 
@@ -504,7 +518,7 @@ Release 版本禁止通过 MQTT 输出：
 | `gw_protocol_publish_status()` | 发布状态 |
 | `gw_protocol_publish_property(keys)` | 发布属性 |
 | `gw_protocol_publish_ota_progress(request_id, progress)` | 发布 OTA 进度 |
-| `gw_protocol_publish_script_exception(info)` | 发布脚本异常 |
+| `gw_business_mqtt_publish(topic, payload, len)` | 通过统一 `dev_mqtt` 以 QoS 0 发布 |
 
 ### 20.3 request_id 和互斥任务
 
@@ -547,7 +561,7 @@ HTTP 触发测试：
 
 1. `property.get` 不返回 MQTT 密码。
 2. 错误日志不打印 NVS 加密材料。
-3. 脚本异常上报过长 stack 时截断。
+3. 原始二进制下行只进入 CH37X/Dongle 发送路径，不交给 JSON 解析器。
 
 ## 22. 实现顺序
 
@@ -556,9 +570,9 @@ HTTP 触发测试：
 3. 实现 `request_id` 去重缓存。
 4. 实现互斥任务状态。
 5. 接入查询类方法：`device.status.get`、`task.current.get`、`property.get`。
-6. 接入 `property.set`、`heartbeat.config`、`script.config`。
+6. 接入 `property.set`、`heartbeat.config`，并确认管理 JSON 与 Dongle 原始帧在统一 `dev_mqtt` 内分流。
 7. 接入 `schema.set`、`schema.get`。
 8. 接入 `config.update`。
 9. 接入 `ota.upgrade` 和 OTA 进度上报。
 10. 接入 `log.query` 和 HTTP POST 上传结果应答。
-11. 接入主动状态、属性、日志和脚本异常上报。
+11. 接入主动状态、属性、日志和 Dongle 原始帧上报。

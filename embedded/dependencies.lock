@@ -30,7 +30,7 @@ dependencies:
   iot_usbh_cdc:
     dependencies: []
     source:
-      path: D:\codex\yx-gateway-1\embedded\components\iot_usbh_cdc
+      path: D:\codex\yx_gateway\embedded\components\iot_usbh_cdc
       type: local
     version: 3.0.0
   joltwallet/littlefs:
@@ -49,6 +49,6 @@ direct_dependencies:
 - espressif/iot_usbh_cdc
 - idf
 - joltwallet/littlefs
-manifest_hash: 8d30f9acb770d6556d2c7017f820bdbb02117e07715868edfb1b91c9d60cedb8
+manifest_hash: b0687a7b2c392d61b027e0b269fc56ee9068ff80919ec2c1717bd1b24bbee1ca
 target: esp32s3
 version: 2.0.0

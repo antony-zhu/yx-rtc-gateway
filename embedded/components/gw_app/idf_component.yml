@@ -1,0 +1,4 @@
+dependencies:
+  espressif/cmake_utilities: "1.1.1"
+  espressif/iot_eth: "1.0.0"
+  joltwallet/littlefs: "*"

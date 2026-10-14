@@ -1,0 +1,354 @@
+warning: in the working copy of 'D:\codex\yx-gateway-test\embedded\main\net\gw_4g_ecm.c', LF will be replaced by CRLF the next time Git touches it
+diff --git "a/D:\\codex\\yx-gateway-test\\embedded\\main\\net\\gw_4g_ecm.c" "b/D:\\codex\\yx_gateway\\embedded\\components\\gw_drivers\\src\\gw_4g_ecm.c"
+index ac1ebd9..f1fac4e 100644
+--- "a/D:\\codex\\yx-gateway-test\\embedded\\main\\net\\gw_4g_ecm.c"
++++ "b/D:\\codex\\yx_gateway\\embedded\\components\\gw_drivers\\src\\gw_4g_ecm.c"
+@@ -1,4 +1,4 @@
+-﻿#include "gw_4g_ecm.h"
++#include "gw_4g_ecm.h"
+ 
+ #include <inttypes.h>
+ #include <stdio.h>
+@@ -22,9 +22,7 @@
+ #include "lwip/ip4_addr.h"
+ #include "usb/usb_host.h"
+ 
+-#include "gw_defaults.h"
+-#include "gw_event.h"
+-#include "gw_result.h"
++#include "gw_hw_config.h"
+ 
+ static const char *TAG = "gw_4g_ecm";
+ 
+@@ -33,7 +31,6 @@ static const char *TAG = "gw_4g_ecm";
+ #define GW_4G_EVENT_GOT_IP            BIT2
+ #define GW_4G_EVENT_LOST_IP           BIT3
+ #define GW_4G_EVENT_USB_OPEN_FAILED   BIT4
+-#define GW_4G_NET_LOST_RETRY_US       (250ULL * 1000ULL)
+ 
+ typedef struct {
+     bool initialized;
+@@ -65,19 +62,13 @@ typedef struct {
+     uint8_t cdc_dev_addr;
+     uint8_t cdc_itf_num;
+ 
+-    esp_timer_handle_t net_lost_retry_timer;
+-    bool net_lost_latched;
+-    bool net_lost_posting;
+-    bool net_lost_delivered;
+-    bool net_lost_suppressed;
++    gw_4g_ecm_stage_cb_t stage_cb;
++    void *stage_ctx;
+     bool power_baseline_ready;
+     uint32_t consecutive_start_failures;
+ } gw_4g_ecm_ctx_t;
+ 
+ static gw_4g_ecm_ctx_t s_4g;
+-static portMUX_TYPE s_net_lost_lock = portMUX_INITIALIZER_UNLOCKED;
+-
+-static void clear_net_loss_latch(void);
+ static esp_err_t ecm_stop(void);
+ static esp_err_t ecm_stack_destroy(void);
+ 
+@@ -109,7 +100,8 @@ static void set_stage(gw_4g_ecm_stage_t stage,
+     s_4g.status.stage = stage;
+     if (stage == GW_4G_ECM_STAGE_READY) {
+         s_4g.status.ready = true;
+-    } else if (stage == GW_4G_ECM_STAGE_FAILED ||
++    } else if (stage == GW_4G_ECM_STAGE_DISCONNECTED ||
++               stage == GW_4G_ECM_STAGE_FAILED ||
+                stage == GW_4G_ECM_STAGE_STOPPED ||
+                stage == GW_4G_ECM_STAGE_IDLE) {
+         s_4g.status.ready = false;
+@@ -117,8 +109,10 @@ static void set_stage(gw_4g_ecm_stage_t stage,
+     if (reason != NULL) {
+         copy_text(s_4g.status.reason, sizeof(s_4g.status.reason), reason);
+     }
+-    if (config != NULL && config->stage_cb != NULL) {
+-        config->stage_cb(stage, s_4g.status.reason, config->stage_ctx);
++    gw_4g_ecm_stage_cb_t callback = config != NULL ? config->stage_cb : s_4g.stage_cb;
++    void *callback_ctx = config != NULL ? config->stage_ctx : s_4g.stage_ctx;
++    if (callback != NULL) {
++        callback(stage, s_4g.status.reason, callback_ctx);
+     }
+ }
+ 
+@@ -160,129 +154,6 @@ static void update_ip_status(esp_netif_t *netif, const esp_netif_ip_info_t *ip_i
+     ip4_to_text(&ip_info->gw, s_4g.status.gateway, sizeof(s_4g.status.gateway));
+     update_dns(netif);
+     s_4g.status.ready = true;
+-    clear_net_loss_latch();
+-}
+-
+-/** @brief 清除本轮断网锁存；新 IP 到达或显式重新启动时调用。 */
+-static void clear_net_loss_latch(void)
+-{
+-    portENTER_CRITICAL(&s_net_lost_lock);
+-    s_4g.net_lost_latched = false;
+-    s_4g.net_lost_delivered = false;
+-    portEXIT_CRITICAL(&s_net_lost_lock);
+-
+-    if (s_4g.net_lost_retry_timer != NULL) {
+-        (void)esp_timer_stop(s_4g.net_lost_retry_timer);
+-    }
+-}
+-
+-/** @brief 开关主动停网期间的 NET_LOST 抑制，避免 stop 产生伪断网重试。 */
+-static void suppress_net_loss(bool suppressed)
+-{
+-    portENTER_CRITICAL(&s_net_lost_lock);
+-    s_4g.net_lost_suppressed = suppressed;
+-    s_4g.net_lost_latched = false;
+-    s_4g.net_lost_delivered = false;
+-    portEXIT_CRITICAL(&s_net_lost_lock);
+-
+-    if (s_4g.net_lost_retry_timer != NULL) {
+-        (void)esp_timer_stop(s_4g.net_lost_retry_timer);
+-    }
+-}
+-
+-/** @brief 尝试把已锁存的 NET_LOST 投递给 supervisor；队满时由定时器继续补投。 */
+-static void try_post_latched_net_lost(void)
+-{
+-    bool should_post = false;
+-
+-    portENTER_CRITICAL(&s_net_lost_lock);
+-    if (s_4g.net_lost_latched &&
+-        !s_4g.net_lost_delivered &&
+-        !s_4g.net_lost_posting) {
+-        s_4g.net_lost_posting = true;
+-        should_post = true;
+-    }
+-    portEXIT_CRITICAL(&s_net_lost_lock);
+-    if (!should_post) {
+-        return;
+-    }
+-
+-    gw_event_t event = {
+-        .event_id = GW_EVT_NET_LOST,
+-        /*
+-         * 公共队列为 HIGH/CRITICAL 预留容量；断网事件使用 HIGH，降低首次投递
+-         * 被普通业务突发占满的概率，锁存定时器仍负责极端情况下的补投。
+-         */
+-        .priority = GW_EVENT_PRIORITY_HIGH,
+-        .source = "4g_ecm",
+-        .target = "dev_mgr_task",
+-        .request_id = NULL,
+-        .method = NULL,
+-        .uptime_ms = (uint64_t)now_ms(),
+-        .timestamp = 0,
+-        .result = gw_result_error(GW_RESULT_INTERNAL_ERROR,
+-                                  GW_REASON_NETWORK_UNAVAILABLE,
+-                                  "4g network lost"),
+-        .payload = NULL,
+-        .payload_len = 0,
+-        .release_cb = NULL,
+-    };
+-
+-    esp_err_t err = gw_event_post(&event);
+-    bool retry_needed;
+-    portENTER_CRITICAL(&s_net_lost_lock);
+-    s_4g.net_lost_posting = false;
+-    if (err == ESP_OK && s_4g.net_lost_latched) {
+-        s_4g.net_lost_delivered = true;
+-    }
+-    retry_needed = s_4g.net_lost_latched && !s_4g.net_lost_delivered;
+-    portEXIT_CRITICAL(&s_net_lost_lock);
+-
+-    if (!retry_needed) {
+-        return;
+-    }
+-
+-    ESP_LOGW(TAG, "post net lost failed, retry scheduled: %s", esp_err_to_name(err));
+-    if (s_4g.net_lost_retry_timer != NULL) {
+-        (void)esp_timer_stop(s_4g.net_lost_retry_timer);
+-        esp_err_t timer_err = esp_timer_start_once(s_4g.net_lost_retry_timer,
+-                                                   GW_4G_NET_LOST_RETRY_US);
+-        if (timer_err != ESP_OK) {
+-            ESP_LOGE(TAG,
+-                     "schedule net lost retry failed: %s",
+-                     esp_err_to_name(timer_err));
+-        }
+-    }
+-}
+-
+-/** @brief esp_timer 任务回调，只负责重试一次非阻塞事件投递。 */
+-static void net_lost_retry_timer_cb(void *arg)
+-{
+-    (void)arg;
+-    try_post_latched_net_lost();
+-}
+-
+-/**
+- * @brief 锁存一次真实断网并触发可靠投递。
+- *
+- * Ethernet disconnect 与 lost-IP 通常会成对到达；锁存位保证同一轮只向 supervisor
+- * 交付一条 NET_LOST，避免重复增加指数退避次数。
+- */
+-static void post_net_lost_event(const char *detail)
+-{
+-    (void)detail;
+-    bool first_loss = false;
+-    portENTER_CRITICAL(&s_net_lost_lock);
+-    if (!s_4g.net_lost_suppressed && !s_4g.net_lost_latched) {
+-        s_4g.net_lost_latched = true;
+-        s_4g.net_lost_delivered = false;
+-        first_loss = true;
+-    }
+-    portEXIT_CRITICAL(&s_net_lost_lock);
+-
+-    if (first_loss) {
+-        try_post_latched_net_lost();
+-    }
+ }
+ 
+ static esp_err_t ensure_idf(void)
+@@ -325,7 +196,7 @@ static void iot_eth_event_handler(void *arg,
+             xEventGroupSetBits(s_4g.events, GW_4G_EVENT_LOST_IP);
+         }
+         if (was_ready) {
+-            post_net_lost_event("ecm link down");
++            set_stage(GW_4G_ECM_STAGE_DISCONNECTED, "ecm link down", NULL);
+         }
+     } else if (event_id == IOT_ETH_EVENT_STOP) {
+         /*
+@@ -378,7 +249,7 @@ static void ip_event_handler(void *arg,
+             xEventGroupSetBits(s_4g.events, GW_4G_EVENT_LOST_IP);
+         }
+         if (was_ready) {
+-            post_net_lost_event("ecm lost ip");
++            set_stage(GW_4G_ECM_STAGE_DISCONNECTED, "ecm lost ip", NULL);
+         }
+     }
+ }
+@@ -447,12 +318,6 @@ static esp_err_t port_init(void)
+     ESP_RETURN_ON_ERROR(gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_CTRL, 0),
+                         TAG,
+                         "set 4g power ctrl failed");
+-    ESP_RETURN_ON_ERROR(configure_gpio((gpio_num_t)GW_4G_PIN_DETECT,
+-                                       GPIO_MODE_INPUT,
+-                                       GPIO_PULLUP_ENABLE,
+-                                       GPIO_PULLDOWN_DISABLE),
+-                        TAG,
+-                        "config 4g detect failed");
+     ESP_RETURN_ON_ERROR(configure_gpio((gpio_num_t)GW_4G_PIN_POWER_EN,
+                                        GPIO_MODE_OUTPUT,
+                                        GPIO_PULLUP_DISABLE,
+@@ -465,11 +330,6 @@ static esp_err_t port_init(void)
+     return ESP_OK;
+ }
+ 
+-static bool is_detected(void)
+-{
+-    return gpio_get_level((gpio_num_t)GW_4G_PIN_DETECT) == 0;
+-}
+-
+ static void power_on(void)
+ {
+     ESP_LOGI(TAG, "4g power on");
+@@ -484,6 +344,7 @@ static void power_on(void)
+     (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_EN, 1);
+     vTaskDelay(pdMS_TO_TICKS(GW_4G_POWER_ON_DELAY_MS));
+     (void)gpio_set_level((gpio_num_t)GW_4G_PIN_POWER_EN, 0);
++    vTaskDelay(pdMS_TO_TICKS(GW_4G_POWER_STABLE_MS));
+ }
+ 
+ static void power_off(void)
+@@ -695,6 +556,8 @@ static void cdc_device_event_cb(usbh_cdc_device_event_t event,
+         port_config.out_ringbuf_size = GW_4G_CDC_TX_BUFFER_BYTES;
+         port_config.in_transfer_buffer_size = GW_4G_CDC_TRANSFER_BUFFER_BYTES;
+         port_config.out_transfer_buffer_size = GW_4G_CDC_TRANSFER_BUFFER_BYTES;
++        /* AT 通道不使用 CDC notification，少占用一个 HCD pipe 和 DMA QTD。 */
++        port_config.flags = USBH_CDC_FLAGS_DISABLE_NOTIFICATION;
+         port_config.cbs.closed = cdc_port_closed_cb;
+ 
+         ret = usbh_cdc_port_open(&port_config, &s_4g.cdc_port);
+@@ -1478,6 +1341,7 @@ static esp_err_t modem_enter_ecm(char *status, size_t status_size)
+ {
+     char raw[GW_4G_AT_RESPONSE_BUFFER_BYTES] = {0};
+     int mode = 0;
++    bool connected = false;
+ 
+     ESP_LOGI(TAG, "entering 4g ECM mode");
+     (void)at_command("ATE0", "\r\nOK\r\n", 800, 1, NULL, 0);
+@@ -1517,6 +1381,7 @@ static esp_err_t modem_enter_ecm(char *status, size_t status_size)
+     for (int i = 0; i < 6; ++i) {
+         memset(raw, 0, sizeof(raw));
+         if (modem_get_ecm_status(raw, sizeof(raw)) == ESP_OK && mdialup_is_connected(raw)) {
++            connected = true;
+             break;
+         }
+         vTaskDelay(pdMS_TO_TICKS(500));
+@@ -1527,7 +1392,7 @@ static esp_err_t modem_enter_ecm(char *status, size_t status_size)
+     }
+     sanitize_response(raw);
+     ESP_LOGI(TAG, "ECM dial status: %s", raw[0] != '\0' ? raw : "<empty>");
+-    return ESP_OK;
++    return connected ? ESP_OK : ESP_ERR_INVALID_STATE;
+ }
+ 
+ static esp_err_t modem_exit_ecm(void)
+@@ -1803,18 +1668,6 @@ esp_err_t gw_4g_ecm_init(void)
+     ESP_RETURN_ON_FALSE(s_4g.events != NULL, ESP_ERR_NO_MEM, TAG, "create 4g event group failed");
+     s_4g.at_lock = xSemaphoreCreateMutex();
+     ESP_RETURN_ON_FALSE(s_4g.at_lock != NULL, ESP_ERR_NO_MEM, TAG, "create at mutex failed");
+-    const esp_timer_create_args_t lost_timer_args = {
+-        .callback = net_lost_retry_timer_cb,
+-        .arg = NULL,
+-        .dispatch_method = ESP_TIMER_TASK,
+-        .name = "4g_loss_retry",
+-        .skip_unhandled_events = true,
+-    };
+-    ESP_RETURN_ON_ERROR(esp_timer_create(&lost_timer_args,
+-                                         &s_4g.net_lost_retry_timer),
+-                        TAG,
+-                        "create net lost retry timer failed");
+-
+     s_4g.status.initialized = true;
+     s_4g.status.stage = GW_4G_ECM_STAGE_IDLE;
+     s_4g.status.modem.rssi = 99;
+@@ -1870,7 +1723,8 @@ esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
+     ESP_RETURN_ON_ERROR(ensure_idf(), TAG, "esp netif init failed");
+     ESP_RETURN_ON_ERROR(register_event_handlers(), TAG, "register events failed");
+ 
+-    suppress_net_loss(false);
++    s_4g.stage_cb = config != NULL ? config->stage_cb : NULL;
++    s_4g.stage_ctx = config != NULL ? config->stage_ctx : NULL;
+     set_stage(GW_4G_ECM_STAGE_STARTING, "4g starting", config);
+     clear_ip_status();
+     copy_text(s_4g.status.apn, sizeof(s_4g.status.apn), apn);
+@@ -1879,9 +1733,6 @@ esp_err_t gw_4g_ecm_start(const gw_4g_ecm_start_config_t *config)
+     if (err != ESP_OK) {
+         goto fail;
+     }
+-    if (!is_detected()) {
+-        ESP_LOGW(TAG, "4g detect pin is not active, continue");
+-    }
+     err = ecm_stack_create();
+     if (err != ESP_OK) {
+         goto fail;
+@@ -2005,7 +1856,6 @@ fail:
+     }
+     clear_ip_status();
+     s_4g.status.modem.registered = false;
+-    suppress_net_loss(true);
+     (void)ecm_stop();
+     power_off();
+     esp_err_t cleanup_err = usb_stack_destroy();
+@@ -2022,7 +1872,6 @@ esp_err_t gw_4g_ecm_stop(void)
+ {
+     ESP_RETURN_ON_ERROR(gw_4g_ecm_init(), TAG, "4g init failed");
+ 
+-    suppress_net_loss(true);
+     if (s_4g.status.stage == GW_4G_ECM_STAGE_READY) {
+         (void)modem_exit_ecm();
+     }
+@@ -2131,6 +1980,8 @@ const char *gw_4g_ecm_stage_to_string(gw_4g_ecm_stage_t stage)
+         return "getting_ip";
+     case GW_4G_ECM_STAGE_READY:
+         return "ready";
++    case GW_4G_ECM_STAGE_DISCONNECTED:
++        return "disconnected";
+     case GW_4G_ECM_STAGE_FAILED:
+         return "failed";
+     case GW_4G_ECM_STAGE_STOPPED:
