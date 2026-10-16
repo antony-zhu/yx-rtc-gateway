@@ -1310,7 +1310,7 @@ bool gw_ota_manager_has_pending_upgrade(void)
     return pending;
 }
 
-esp_err_t gw_ota_manager_start_pending_upgrade(void)
+esp_err_t gw_ota_manager_start_pending_upgrade(bool gateway_protocol, const char *request_id)
 {
     if (s_ota_queue == NULL || s_ota_task_handle == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -1318,7 +1318,9 @@ esp_err_t gw_ota_manager_start_pending_upgrade(void)
 
     gw_ota_upgrade_request_t request;
     portENTER_CRITICAL(&s_ota_lock);
-    if (!s_pending_upgrade_valid) {
+    if (!s_pending_upgrade_valid || request_id == NULL ||
+        s_pending_upgrade.gateway_protocol != gateway_protocol ||
+        strcmp(s_pending_upgrade.request_id, request_id) != 0) {
         portEXIT_CRITICAL(&s_ota_lock);
         return ESP_ERR_NOT_FOUND;
     }
@@ -1348,13 +1350,17 @@ esp_err_t gw_ota_manager_start_pending_upgrade(void)
     return ESP_ERR_TIMEOUT;
 }
 
-void gw_ota_manager_cancel_pending_upgrade(const char *reason)
+void gw_ota_manager_cancel_pending_upgrade(bool gateway_protocol,
+                                           const char *request_id,
+                                           const char *reason)
 {
     gw_ota_upgrade_request_t request;
     bool had_pending = false;
 
     portENTER_CRITICAL(&s_ota_lock);
-    if (s_pending_upgrade_valid) {
+    if (s_pending_upgrade_valid && request_id != NULL &&
+        s_pending_upgrade.gateway_protocol == gateway_protocol &&
+        strcmp(s_pending_upgrade.request_id, request_id) == 0) {
         request = s_pending_upgrade;
         memset(&s_pending_upgrade, 0, sizeof(s_pending_upgrade));
         s_pending_upgrade_valid = false;

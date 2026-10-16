@@ -327,3 +327,70 @@
 - 为避免首轮现场协调超时，尚未运行的离线重启脚本已把拔线等待改为 90 秒，首个到期安排在至少 2 分钟后：duration 为 3/5 分钟，interval 为 2 分钟，daily 错开完成时刻；这是针对已发生协调超时的测试安排调整，没有修改固件或自动重跑。
 - 物理断网及断网后重启的组合测试尚未完成，不能计为通过；仍需用户现场操作网线。已通过的联网重启测试不重复执行；当前不遗留测试任务、监听进程或连接。
 
+
+## 2026-10-14 14:36（Asia/Shanghai）：当前代码远程备份及未提交改动减法审查
+
+- 用户要求备份当前代码，有远程 Git 则远程备份，然后审查当前全部未提交改动。沿用已确认的只读审查范围，不自动应用修复，不构建、不运行代码测试或静态分析工具。
+- origin 为 https://github.com/antony-zhu/yx-rtc-gateway.git。用户本轮明确授权远程备份。使用独立临时 Git index 捕获当前全部已跟踪和未忽略文件（包括未跟踪文件），不纳入 ignored 的 tmp、构建缓存和日志；快照保留当前实际文件字节。
+- 备份分支 backup/20261014-141906-before-subtraction-review；提交 6c938abb31f8f2d3527c7cca50ada4430a8a0cad，父提交 8600e2fd5bba4ac00587c076413e6f2f2e9fd049，tree ad4e8fd4438e039713be90ccf40a008ce2983e5d。已推送 origin，并用 ls-remote 确认远端分支指向该提交。
+- 创建快照前后确认原 index SHA-256、当前分支和完整工作区状态不变；仍位于 codex/fix-hardware-io-network。临时 index 已清理，未暂存或提交到当前工作分支。本日志追加记录晚于备份，不属于该快照。
+- 审查覆盖新旧 MQTT/OTA 并发路径、定时器与授时、网络抽象和以太网/4G 生命周期、驱动迁移与相关协议文档。仅报告本次改动引入且有直接路径证据的问题，未把已确认暂停的 Cron/BLE 服务、既有请求缓存策略、同版本 OTA 或可选重构列为问题。
+- P1，gw_ethernet.c:283–289：停止 USB 事件泵后忽略 free_all 结果并立即 uninstall。ESP-IDF 本地 USB 实现可异步释放设备并返回 NOT_FINISHED，要求继续 handle_events 至 ALL_FREE；此时卸载失败但代码仍丢弃 ready 和 task，后续 install 持续 INVALID_STATE。最小修复为完成异步释放/卸载后再清除状态，不添加另一套恢复状态机。
+- P1，gw_net_manager.c:303：4G 驱动 READY 后仍查询九条 AT 信息，期间断网回调置 DISCONNECTED，supervisor 因 worker_running 忽略 NET_LOST；worker 最后又无条件覆盖 CONNECTED。本次 supervisor 同时去掉对 driver.ready 的周期核对，导致断网状态被抹掉而无法正常恢复。最小修复为去掉 worker 成功尾部的重复连接状态覆盖，以驱动实时状态为准。
+- P1，gw_gateway_protocol.c:284–295 与 gw_protocol_manager.c:3470–3528：新 gateway_cmd 接收 OTA 后、启动 worker 前，旧 dev_mgr_task 中无关请求也会查询并启动/取消同一个全局 pending OTA。旧请求可抢先启动，使新处理器报 code=14，或直接取消已接收升级。最小修复为移除旧通用回复路径对其他请求 pending OTA 的控制，只允许接受该旧 OTA 请求的路径启动/取消自身操作。此为并发代码路径证据，不能把先前实机 progress 早于 ACK 的观察直接归因于此。
+- P2，gw_gateway_timer.c:908、970–981：gw_time 已区分可信恢复/大幅校时与不超过 5 分钟的小幅校时，但 timer 再用 UTC 精确差异触发完整 reconcile。若小幅校时跨过等待任务的到期点，duration 被停用而未执行，interval/daily 跳过本次。最小修复为统一使用既有 rebase 决策，小幅校时保留单调时钟到期边界并更新其持久化 UTC 投影。
+- P2，gw_ethernet.c:499–506：若上电等待或 USB 轮询期间异步 GOT_IP 已置 READY，随后无条件设 GETTING_IP 会清掉 ready，尽管事件位已置仍走超时清理。最小修复为删除或提前该阶段写入，不覆盖已经完成的 DHCP 状态。此为确定的异步交错路径，未宣称已在板上复现。
+- P2，docs/24-Cron定时任务MQTT协议.md:15–16：新文档 Topic 示例多出前导斜杠，而当前 gw_business_mqtt.c:1712–1753 实际格式为 yx_gw/...，没有前导斜杠。按文档直接发布会进入另一个 Topic，无法获得设备应答。最小修复为删除错误前导斜杠并同步对应测试示例。
+- 以上仅为审查结论，未修改生产源码或协议文档；后续修复范围仍待用户选择，不把代码路径分析标为实机复现。
+
+## 2026-10-14 14:36（Asia/Shanghai）：离线测试协调窗口调整
+
+- 第二轮五任务离线脚本仍在用户实际拔线前达到 90 秒等待上限，已清理全部本轮任务并恢复空表，未执行离线复位。证据 tmp/com9_ethernet_e2e_offline_reboot_142248.json passed=false、original_table_restored=true，不能计为离线通过。
+- 用户随后确认网线已拔下、USB 保持连接。已说明固定等待窗口不适合现场响应，并请求接回以重新保存持续周期任务；不重复联网重启和 OTA 等已通过验证。
+- 准备 tmp/com9_offline_interval_check.py，仅创建一条 interval 1 分钟、delay 500ms 的唯一测试任务，等待串口实际 NET_LOST，无人工操作超时；离线观察两次完成后 RTS 复位，再观察两次完成，核对 ota_0、RTC、重连后的任务配置与递增执行计数，并只清理本轮任务。脚本支持 stop 文件取消并等待恢复网络完成清理。
+- 当前新脚本尚未运行，设备无本轮遗留任务；等待用户接回网线。这里只调整已授权硬件验证的协调方式，不修改固件、不构建、不运行其他检查。
+
+## 2026-10-14 14:58（Asia/Shanghai）：持续周期任务离线及离线重启验证通过
+
+- 用户接回网线后运行 tmp/com9_offline_interval_check.py，保存唯一任务 19（interval 1 分钟，delay 500ms，revision=1）。用户随后拔线，串口在 14:50:54 确认 NET_LOST；无人工操作等待超时，没有修改固件。
+- 断网前已收到 occurrence_id=1、2。14:51:09、14:52:09 观察到两次动作结束后的 fired 发布丢弃日志，间隔约 59.985 秒；按协议离线不上报且不缓存事件。初始任务表为空且仅创建此 delay 任务，因此日志可归属本次测试。
+- 第二次离线完成后执行 RTS 复位，USB 供电保持。启动日志两次出现 ota_0 0x330000，最终时间初始化确认 rtc_read/valid=true、vlf/stop=false、recovery_required=false、reason=none。此为复位验证，不是整板断电及 RTC 电池保持测试。
+- 复位后 14:53:09、14:54:09 又连续完成两次；跨复位间隔约 60.531 秒，随后间隔约 59.984 秒。等待用户接回网线期间继续执行，离线共记录 6 次完成，全部间隔在 55–65 秒验证范围内，离线观察期间无 NET_READY/MQTT 上线事件。
+- 用户接回网线后，14:56:43 MQTT 上线；get 返回任务完整配置与创建时一致（revision=1）。14:57:08 对应的在线事件 occurrence_id=9、success=true、esp_err=0，与断网前 2 次及离线 6 次相符，确认执行计数跨复位持久化。
+- 删除且仅删除本次唯一名称和 ID 对应任务；最终空表，original_table_restored=true、cleanup_status=complete。脚本退出 0，passed=true，串口采集无错误；COM9 和测试 MQTT 连接均已关闭。
+- 证据 tmp/com9_ethernet_e2e_offline_interval_144802.json、tmp/offline_interval_144802.log。实测动作仅 delay，未执行实际控灯。离线加复位覆盖 interval；此前联网复位已经覆盖 duration、interval、daily，未重复这些已通过用例，也未宣称三种任务均分别完成离线断电测试。
+- 先前两个物理协调超时的失败记录保留；本次单独记录通过，不覆盖失败证据。本次实机结果不消除减法审查发现的校时边界或并发/恢复问题，尚未修复生产代码。
+
+## 2026-10-14 17:02（Asia/Shanghai）：减法审查问题修复及基础验证（进行中）
+
+- 用户明确要求“修复并完成基础测试，包括 OTA 和定时任务下发和执行”，确认上一轮 6 项问题的最小修复路径及相关基础验证。沿用 COM9 以太网板、既有 Topic 和协议，定向 Host 测试、一次以太网构建、应用分区烧录及 MQTT OTA/定时任务实测；不新增备份、提交、推送或扩大功能。
+- 网络修复：USB 退出继续处理异步释放事件直到 ALL_FREE，并保留 Host 归属至卸载成功；退出中的 Host 不复用。将 WAIT_USB 放到启动前、GETTING_IP 放到连接回调，避免覆盖异步 DHCP READY。net_worker 不再无条件写 CONNECTED，仅在驱动仍连接时发出 READY，保留启动尾部的真实断网状态。
+- OTA 修复：pending start/cancel 在锁内匹配协议来源及 request_id；旧协议只等待、启动或取消本次确实接受的 ota.upgrade，不再控制其他请求的 pending。新协议传入自身来源和 ID；公开 buffer API、旧 request-id 缓存语义和配置更新行为不变。
+- 定时器修复：将显式 rebase（启动、可信恢复、时区变化、大幅校时）与小幅 UTC 变化分开。小幅校时保留 duration/interval 单调到期边界与 daily 待执行点，并更新持久化 UTC 投影；大幅校时与重启仍按约定跳过错过点。无需修改 gw_time.c。
+- 文档修复：仅删除 docs/20-测试流程.md、docs/24-Cron定时任务MQTT协议.md 相关 Topic 示例的错误前导斜杠。
+- 三个独立代理均使用 GPT-6.1 Sol / ultra，分别拥有网络、定时器、OTA 源码和对应测试；主代理负责文档、日志、构建与设备，未并发操作串口/MQTT或同一生产文件。修改文件保持 UTF-8 和既有换行风格。
+- 定时器定向测试 tests/gateway_timer/run.ps1 首次通过，共 10 个场景：小幅正负校时后的重启投影、校时跨到期边界与存储失败重试、daily 不重复、大幅校时和可信恢复跳过规则等。
+- 网络定向测试 python tests/network_lifecycle/run_host_tests.py --compiler C:/msys64/mingw64/bin/gcc.exe 首次通过：直接编译生产实现，分别覆盖 4G/Ethernet 的启动成功、启动中断网、重试、失败；Ethernet 多个 DHCP 时点、USB NOT_FINISHED 到 ALL_FREE、卸载失败保留归属。
+- OTA 定向测试 python tests/gateway_ota/run_host_tests.py --compiler C:/msys64/mingw64/bin/gcc.exe --idf C:/Espressif/frameworks/esp-idf-v5.5.3 首次通过。新增测试执行真实 OTA manager 与提取的真实旧协议处理函数，验证无关成功/失败/畸形旧请求不启动或取消新 OTA、旧请求自身接受/取消、重复请求及来源/ID不匹配。
+- 网关协议定向测试 tests/gateway_protocol/run.ps1 首次通过，确认新路径携带自身 OTA 归属。未重复无关 transport、打包器或全回归测试。
+- 复用 embedded/build-ethernet，以 ESP-IDF 5.5.3、--no-ccache、GW_NETWORK_TARGET=ETHERNET 构建一次成功；未新增缓存，既有旧 4G 缓存因前轮审批拒绝清理仍保持，不重试删除。应用 1,102,944 字节，3 MiB 分区余约 65%。
+- 新固件裸镜像 SHA-256 89476033d9f8d69a1a8bc60e6b42a3b38543a1c35f7edcc5045e2ebf548ea2b3；ELF SHA-256 b74b4f191ea9eecb29ab60dfc36f2c3a50a0249b2d2222f76e7ae04887628ad0。YXOT 位于 embedded/build-ethernet/yx_gateway.yxot.bin，大小 1,102,984，容器 SHA-256 855ac542f4cbfd8af32c5f53cb6d7d42f6ad93cd84d990d95906ba10a7d76209。
+- 实测准备脚本 tmp/com9_review_fix_check.py 复用既有 Session 与单镜像 HTTP 服务，OTA 后依据串口实际启动/联网完成再探测，不使用先前不足的固定 30 秒等待。定时任务仅 delay 500ms，覆盖批量保存、revision 冲突整批不变、启用、duration/interval/daily 执行与所属任务清理。
+- COM9 预检确认同一 CH9102/ESP32-S3 MAC 441BF6CA5E4C、当前 ota_0 0x330000、以太网 192.168.0.253、MQTT 上线；预检证据 tmp/com9_ethernet_e2e_fix_preflight_165825.json passed=true。仅烧当前 ota_0 应用地址 0x330000，Hash of data verified；未写 bootloader、分区表、otadata、NVS 或文件系统。后续启动确认新 ELF b74b4f191、RTC 有效。
+
+## 2026-10-14 17:05（Asia/Shanghai）：修复后 COM9 OTA 与定时任务基础实测通过
+
+- 运行 tmp/com9_review_fix_check.py 一次完整基础实测，证据 tmp/com9_ethernet_e2e_fix_basic_170043.json passed=true，进程退出 0；串口日志 tmp/fix_basic_170043.log，无采集错误。没有为通过而重发 OTA 或覆盖失败记录。
+- 新固件从 ota_0 启动并确认 ELF b74b4f191 后，以 config_down 下发 gateway.ota；电脑 192.168.0.3:8000 的单文件 HTTP 服务完整提供 1,102,984 字节 YXOT。收到 ACK、8 条符合容器大小/范围的 progress 和 result code=0/message=OTA completed。
+- 串口确认软件重启后从 ota_1 0x630000 启动，ELF b74b4f191 与本轮构建一致，RTC 恢复有效，以太网/MQTT 重新上线；上线后 timer.list 成功。设备目前运行修复后的以太网固件 ota_1；版本文本仍为既有 8600e2f-dirty，使用 ELF/容器 SHA 区分本次镜像。
+- 定时任务初始表为空，批量创建 duration、interval、daily 三条停用任务（ID 20、21、22），查询一致且 revision=1。批量 revision 冲突返回 code=5，各项配置均不改变；随后启用均 revision=2。
+- 三条任务分别收到 occurrence_id=1、success=true、esp_err=0 的 gateway.timer.fired。duration 到期后自动 enabled=false/revision=3，interval 和 daily 保持 enabled=true/revision=2。动作均为 delay 500ms，不宣称实际灯具控制已验证。
+- 仅删除本次创建的三条测试任务，最终任务表为空且 original_table_restored=true；电脑 HTTP 服务、MQTT 测试连接和 COM9 串口均已关闭，无遗留测试任务。
+- 本轮 4 套定向 Host 测试、1 次以太网固件构建、应用写入校验及上述实测均通过。4G 网络分支通过 Host 生命周期回归，未在 4G 板上实测或额外构建。未重复上一轮物理断网测试、全量回归或实施额外审查；本轮六项问题修复完成。
+- 相关文本格式检查通过；当前工作分支未暂存、提交或推送本轮修复。此前远程备份仍为修复前快照 6c938abb31f8f2d3527c7cca50ada4430a8a0cad。
+
+## 2026-10-16 10:50（Asia/Shanghai）：修复后代码远程备份
+
+- 用户明确要求将修复后的代码也备份到远程 Git。使用新的备份分支 backup/20261016-105042-after-subtraction-fixes，通过临时独立 index 捕获当前已跟踪和未忽略文件；包含六项修复、对应测试、协议文档及开发日志。
+- 沿用 origin 仓库 https://github.com/antony-zhu/yx-rtc-gateway.git；远程备份已由本轮明确授权。保留当前工作分支、真实暂存区和其他未提交改动，不构建、不运行测试、不操作设备，不纳入忽略的 tmp、构建缓存及固件产物。
+- 本次备份提交以前次修复前快照 6c938abb31f8f2d3527c7cca50ada4430a8a0cad 为父提交，便于比较修复内容；最终提交引用及远端核对结果在完成后补记。

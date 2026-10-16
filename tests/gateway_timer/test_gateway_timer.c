@@ -353,6 +353,122 @@ static void time_rules_and_daily_rollback(void)
     assert(send_count == 2);
 }
 
+static void small_correction_restart_projection(void)
+{
+    for (int direction = -1; direction <= 1; direction += 2) {
+        fresh();
+        uint64_t base_utc_ms = test_clock.utc_ms;
+        cJSON *response = request("upsert", "{\"task\":["
+            CONFIG("true", "duration", "duration", CONTROL_ON) ","
+            CONFIG("true", "interval", "interval", CONTROL_OFF) "]}", 0);
+        cJSON_Delete(response);
+        elapse(20000);
+        gw_gateway_timer_time_change_begin();
+        test_clock.utc_ms = (uint64_t)((int64_t)test_clock.utc_ms + direction * 1000);
+        gw_gateway_timer_time_change_finish(false);
+        elapse(0);
+        assert(send_count == 0);
+        assert(s_table.tasks[0].due_uptime_ms == 60000);
+        assert(s_table.tasks[1].due_uptime_ms == 60000);
+        reboot();
+        elapse(39999);
+        assert(send_count == 0);
+        elapse(1);
+        assert(send_count == 2 && event_count == 2);
+        assert(!task_enabled(&s_table.tasks[0]));
+        uint64_t scheduled = (uint64_t)((int64_t)base_utc_ms + 60000 + direction * 1000);
+        assert((uint64_t)field(last_event, "scheduled_utc_ms")->valuedouble == scheduled);
+    }
+}
+
+static void small_correction_crosses_deadline(void)
+{
+    for (int direction = -1; direction <= 1; direction += 2) {
+        fresh();
+        uint64_t base_utc_ms = test_clock.utc_ms;
+        cJSON *response = request("upsert", "{\"task\":["
+            CONFIG("true", "duration", "duration", CONTROL_ON) ","
+            CONFIG("true", "interval", "interval", CONTROL_OFF) ","
+            "{\"enabled\":true,\"name\":\"daily\",\"type\":\"daily\",\"schedule\":{\"hour\":0,\"minute\":1},\"action\":[" CONTROL_ON "]}]}", 0);
+        cJSON_Delete(response);
+        elapse(59990);
+        gw_gateway_timer_time_change_begin();
+        elapse(20);
+        test_clock.utc_ms = (uint64_t)((int64_t)test_clock.utc_ms + direction * 1000);
+        elapse(0);
+        assert(send_count == 0 && event_count == 0);
+        gw_gateway_timer_time_change_finish(false);
+        fail_save = true;
+        elapse(0);
+        assert(send_count == 0 && event_count == 0);
+        fail_save = false;
+        elapse(0);
+        assert(send_count == (direction > 0 ? 3U : 2U));
+        assert(!task_enabled(&s_table.tasks[0]));
+        assert(s_table.tasks[1].occurrence_id == 1);
+        assert(s_table.tasks[1].due_uptime_ms == 120000);
+        uint64_t scheduled = (uint64_t)((int64_t)base_utc_ms + 60000 + direction * 1000);
+        assert(s_table.tasks[0].scheduled_utc_ms == scheduled);
+        assert(s_table.tasks[1].scheduled_utc_ms == scheduled);
+        if (direction < 0) {
+            elapse(989);
+            assert(send_count == 2);
+            elapse(1);
+        }
+        assert(send_count == 3 && event_count == 3);
+        assert((uint64_t)field(last_event, "scheduled_utc_ms")->valuedouble == base_utc_ms + 60000);
+        gw_gateway_timer_time_change_begin();
+        test_clock.utc_ms -= 2000;
+        gw_gateway_timer_time_change_finish(false);
+        elapse(2000);
+        assert(send_count == 3);
+        elapse(119999 - test_clock.uptime_ms);
+        assert(send_count == 3);
+        elapse(1);
+        assert(send_count == 4 && event_count == 4);
+        assert(s_table.tasks[1].occurrence_id == 2);
+    }
+}
+
+static void rebase_skips_missed_occurrences(void)
+{
+    for (int restore_trust = 0; restore_trust <= 1; ++restore_trust) {
+        fresh();
+        uint64_t base_utc_ms = test_clock.utc_ms;
+        cJSON *response = request("upsert", "{\"task\":["
+            CONFIG("true", "duration", "duration", CONTROL_ON) ","
+            CONFIG("true", "interval", "interval", CONTROL_OFF) ","
+            "{\"enabled\":true,\"name\":\"daily\",\"type\":\"daily\",\"schedule\":{\"hour\":0,\"minute\":1},\"action\":[" CONTROL_ON "]}]}", 0);
+        cJSON_Delete(response);
+        elapse(59990);
+        gw_gateway_timer_time_change_begin();
+        if (restore_trust) {
+            test_clock.utc_trusted = false;
+            test_clock.utc_ms = 0;
+            gw_gateway_timer_time_change_finish(true);
+            elapse(20);
+            assert(send_count == 0);
+            gw_gateway_timer_time_change_begin();
+            test_clock.utc_trusted = true;
+            test_clock.utc_ms = base_utc_ms + 660010;
+        } else {
+            elapse(20);
+            test_clock.utc_ms += 600000;
+        }
+        gw_gateway_timer_time_change_finish(true);
+        elapse(0);
+        assert(send_count == 0 && event_count == 0);
+        assert(!task_enabled(&s_table.tasks[0]));
+        assert(s_table.tasks[1].due_uptime_ms == 120000);
+        assert(s_table.tasks[2].next_utc_ms == base_utc_ms + TIMER_DAY_MS + 60000);
+        elapse(59989);
+        assert(send_count == 0);
+        elapse(1);
+        assert(send_count == 1 && event_count == 1);
+        assert(s_table.tasks[1].occurrence_id == 1);
+    }
+}
+
 static void payload_and_validation(void)
 {
     fresh();
@@ -389,10 +505,13 @@ int main(void)
     claim_persistence_and_restart();
     interval_no_overlap();
     time_rules_and_daily_rollback();
+    small_correction_restart_projection();
+    small_correction_crosses_deadline();
+    rebase_skips_missed_occurrences();
     payload_and_validation();
     free_table(&s_table);
     free(persisted);
     cJSON_Delete(last_event);
-    puts("gateway timer: 7 focused scenarios passed");
+    puts("gateway timer: 10 focused scenarios passed");
     return 0;
 }

@@ -133,6 +133,9 @@ static void ethernet_event_handler(void *arg,
 
     if (event_id == IOT_ETH_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "CH397 ethernet link up");
+        if (!s_eth.stopping) {
+            set_stage(GW_ETH_STAGE_GETTING_IP, "ethernet getting ip");
+        }
         return;
     }
     if (event_id != IOT_ETH_EVENT_DISCONNECTED) {
@@ -272,18 +275,32 @@ static void usb_host_task(void *arg)
         return;
     }
 
-    while (!s_eth.usb_host_stop) {
+    bool all_free = false;
+    while (true) {
         uint32_t flags = 0;
         err = usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "USB host event failed: %s", esp_err_to_name(err));
         }
-    }
-
-    (void)usb_host_device_free_all();
-    err = usb_host_uninstall();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "USB host uninstall failed: %s", esp_err_to_name(err));
+        if (!s_eth.usb_host_stop) {
+            continue;
+        }
+        all_free = all_free || (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0U;
+        if (!all_free) {
+            err = usb_host_device_free_all();
+            all_free = err == ESP_OK;
+            if (err != ESP_OK && err != ESP_ERR_NOT_FINISHED) {
+                ESP_LOGW(TAG, "USB host free devices failed: %s", esp_err_to_name(err));
+            }
+        }
+        if (all_free) {
+            err = usb_host_uninstall();
+            if (err == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "USB host uninstall failed: %s", esp_err_to_name(err));
+            all_free = false;
+        }
     }
     s_eth.usb_host_ready = false;
     s_eth.usb_host_task = NULL;
@@ -292,8 +309,10 @@ static void usb_host_task(void *arg)
 
 static esp_err_t start_usb_host(void)
 {
-    if (s_eth.usb_host_ready) {
-        return ESP_OK;
+    if (s_eth.usb_host_task != NULL) {
+        return s_eth.usb_host_ready && !s_eth.usb_host_stop
+                   ? ESP_OK
+                   : ESP_ERR_INVALID_STATE;
     }
     s_eth.usb_host_stop = false;
     BaseType_t created = xTaskCreatePinnedToCore(usb_host_task,
@@ -468,12 +487,12 @@ esp_err_t gw_ethernet_start(const gw_ethernet_start_config_t *config)
     if (err != ESP_OK) {
         goto fail;
     }
+    set_stage(GW_ETH_STAGE_WAIT_USB, "ethernet wait usb");
     err = iot_eth_start(s_eth.eth);
     if (err != ESP_OK) {
         goto fail;
     }
     s_eth.eth_started = true;
-    set_stage(GW_ETH_STAGE_WAIT_USB, "ethernet wait usb");
 
     err = gpio_set_level((gpio_num_t)GW_ETH_PIN_POWER_CTRL,
                          GW_ETH_POWER_CTRL_ACTIVE_LEVEL);
@@ -496,7 +515,6 @@ esp_err_t gw_ethernet_start(const gw_ethernet_start_config_t *config)
         goto fail;
     }
 
-    set_stage(GW_ETH_STAGE_GETTING_IP, "ethernet getting ip");
     EventBits_t bits = xEventGroupWaitBits(s_eth.events,
                                            GW_ETH_EVENT_GOT_IP |
                                                GW_ETH_EVENT_LOST_IP,

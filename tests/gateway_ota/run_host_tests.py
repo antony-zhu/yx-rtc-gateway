@@ -24,9 +24,14 @@ def main():
     environment["PATH"] = compiler_directory + os.pathsep + environment.get("PATH", "")
     with tempfile.TemporaryDirectory(prefix="gateway-ota-tests-") as directory:
         output = Path(directory) / "gateway-ota-tests.exe"
+        # Compile the production legacy reply controller against focused dispatch mocks.
+        protocol = (ROOT / "embedded/components/gw_app/src/gw/gw_protocol_manager.c").read_text(encoding="utf-8")
+        start = protocol.index("static esp_err_t handle_down_to_buffer(")
+        end = protocol.index("\nesp_err_t gw_protocol_publish_schedule_fired(", start)
+        (Path(directory) / "legacy_reply_under_test.h").write_text(protocol[start:end], encoding="utf-8")
         command = [args.compiler, "-std=gnu11", "-O0", "-g",
                    '-DMBEDTLS_CONFIG_FILE="ota_mbedtls_config.h"',
-                   "-I", str(source_dir / "stubs"),
+                   "-I", str(source_dir / "stubs"), "-I", directory,
                    "-I", str(ROOT / "embedded/components/gw_app/include"),
                    "-I", str(cjson), "-I", str(mbedtls / "include"),
                    str(source_dir / "test_ota.c"), str(cjson / "cJSON.c"),

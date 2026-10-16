@@ -3272,7 +3272,7 @@ esp_err_t gw_protocol_init(void)
     return ESP_OK;
 }
 
-esp_err_t gw_protocol_handle_down_to_buffer(const char *topic,
+static esp_err_t handle_down_to_buffer(const char *topic,
                                             const void *payload,
                                             size_t payload_len,
                                             char *reply_topic,
@@ -3280,8 +3280,12 @@ esp_err_t gw_protocol_handle_down_to_buffer(const char *topic,
                                             char *reply_payload,
                                             size_t reply_payload_size,
                                             size_t *out_reply_len,
-                                            int32_t *out_code)
+                                            int32_t *out_code,
+                                            char *accepted_ota_request_id)
 {
+    if (accepted_ota_request_id != NULL) {
+        accepted_ota_request_id[0] = '\0';
+    }
     if (!s_initialized || topic == NULL || payload == NULL ||
         reply_topic == NULL || reply_payload == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -3405,6 +3409,10 @@ esp_err_t gw_protocol_handle_down_to_buffer(const char *topic,
         owned_data = dispatch_method(method, request_id, data, &result);
         code = result.code;
         message = result.reason_code != NULL ? result.reason_code : GW_REASON_INTERNAL_ERROR;
+        if (accepted_ota_request_id != NULL && code == GW_RESULT_OK &&
+            strcmp(method, "ota.upgrade") == 0) {
+            strlcpy(accepted_ota_request_id, request_id, GW_REQUEST_ID_MAX_LEN + 1U);
+        }
         if (!(code == GW_RESULT_OK && method_is_async_accept(method))) {
             request_cache_mark_done(request_id, code, message);
         }
@@ -3448,6 +3456,22 @@ esp_err_t gw_protocol_handle_down_to_buffer(const char *topic,
     return err;
 }
 
+esp_err_t gw_protocol_handle_down_to_buffer(const char *topic,
+                                            const void *payload,
+                                            size_t payload_len,
+                                            char *reply_topic,
+                                            size_t reply_topic_size,
+                                            char *reply_payload,
+                                            size_t reply_payload_size,
+                                            size_t *out_reply_len,
+                                            int32_t *out_code)
+{
+    return handle_down_to_buffer(topic, payload, payload_len,
+                                 reply_topic, reply_topic_size,
+                                 reply_payload, reply_payload_size,
+                                 out_reply_len, out_code, NULL);
+}
+
 esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t payload_len)
 {
     char *reply_payload = (char *)gw_mqtt_payload_alloc(GW_MQTT_MAX_PAYLOAD_SIZE + 1U);
@@ -3456,8 +3480,9 @@ esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t
     }
 
     char reply_topic[GW_PROTOCOL_TOPIC_MAX_LEN];
+    char accepted_ota_request_id[GW_REQUEST_ID_MAX_LEN + 1U] = {0};
     size_t reply_len = 0;
-    esp_err_t err = gw_protocol_handle_down_to_buffer(topic,
+    esp_err_t err = handle_down_to_buffer(topic,
                                                       payload,
                                                       payload_len,
                                                       reply_topic,
@@ -3465,10 +3490,11 @@ esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t
                                                       reply_payload,
                                                       GW_MQTT_MAX_PAYLOAD_SIZE + 1U,
                                                       &reply_len,
-                                                      NULL);
+                                                      NULL,
+                                                      accepted_ota_request_id);
+    bool accepted_ota = accepted_ota_request_id[0] != '\0';
     if (err == ESP_OK) {
-        bool wait_accepted_publish = gw_config_manager_has_pending_update() ||
-                                     gw_ota_manager_has_pending_upgrade();
+        bool wait_accepted_publish = gw_config_manager_has_pending_update() || accepted_ota;
         err = wait_accepted_publish ?
               gw_mqtt_manager_publish_wait(reply_topic,
                                            reply_payload,
@@ -3477,7 +3503,10 @@ esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t
               gw_mqtt_manager_publish(reply_topic, reply_payload, reply_len);
         if (err != ESP_OK) {
             gw_config_manager_cancel_pending_update(GW_REASON_INTERNAL_ERROR);
-            gw_ota_manager_cancel_pending_upgrade(GW_REASON_INTERNAL_ERROR);
+            if (accepted_ota) {
+                gw_ota_manager_cancel_pending_upgrade(false, accepted_ota_request_id,
+                                                       GW_REASON_INTERNAL_ERROR);
+            }
             stats_inc_publish_failed();
             gw_log_write(GW_LOG_LEVEL_WARN,
                          "protocol",
@@ -3507,7 +3536,9 @@ esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t
                                  .detail = "async start failed",
                              }));
             }
-            start_err = gw_ota_manager_start_pending_upgrade();
+            start_err = accepted_ota ?
+                        gw_ota_manager_start_pending_upgrade(false, accepted_ota_request_id) :
+                        ESP_ERR_NOT_FOUND;
             if (start_err != ESP_OK && start_err != ESP_ERR_NOT_FOUND) {
                 gw_log_write(GW_LOG_LEVEL_WARN,
                              "protocol",
@@ -3525,7 +3556,10 @@ esp_err_t gw_protocol_handle_down(const char *topic, const void *payload, size_t
         }
     } else {
         gw_config_manager_cancel_pending_update(GW_REASON_INTERNAL_ERROR);
-        gw_ota_manager_cancel_pending_upgrade(GW_REASON_INTERNAL_ERROR);
+        if (accepted_ota) {
+            gw_ota_manager_cancel_pending_upgrade(false, accepted_ota_request_id,
+                                                   GW_REASON_INTERNAL_ERROR);
+        }
     }
 
     gw_mqtt_payload_free(reply_payload);

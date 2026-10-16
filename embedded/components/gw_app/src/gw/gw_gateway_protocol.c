@@ -292,9 +292,9 @@ static void handle_ota(const char *mt, const cJSON *id, const cJSON *pd)
     /* FIFO insertion precedes worker start. An unavailable QoS0 ACK may be dropped. */
     (void)publish_ack(mt, "plc", id, reply, false);
     cJSON_Delete(reply);
-    err = gw_ota_manager_start_pending_upgrade();
+    err = gw_ota_manager_start_pending_upgrade(true, request.request_id);
     if (err != ESP_OK) {
-        gw_ota_manager_cancel_pending_upgrade(GW_REASON_INTERNAL_ERROR);
+        gw_ota_manager_cancel_pending_upgrade(true, request.request_id, GW_REASON_INTERNAL_ERROR);
         reply = result_pd(14, "OTA worker start failed");
         if (reply != NULL &&
             cJSON_AddStringToObject(reply, "request_id", id->valuestring) != NULL &&

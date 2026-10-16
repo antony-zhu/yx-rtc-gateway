@@ -114,16 +114,24 @@ bool gw_ota_manager_has_pending_upgrade(void);
  * 原有路径在 accepted 应答发布成功后调用；网关路径在 ACK 被尝试或丢弃后调用，
  * 使下载及最终结果排在接收应答之后。
  *
- * @return ESP_OK 表示任务已进入 OTA worker；ESP_ERR_NOT_FOUND 表示当前没有待启动任务。
+ * @param gateway_protocol 请求所属协议，与提交请求保持一致。
+ * @param request_id 提交请求的 ID，不能为空；网关协议允许空字符串。
+ * @return ESP_OK 表示任务已进入 OTA worker；ESP_ERR_NOT_FOUND 表示没有属于该请求的待启动任务。
  */
-esp_err_t gw_ota_manager_start_pending_upgrade(void);
+esp_err_t gw_ota_manager_start_pending_upgrade(bool gateway_protocol, const char *request_id);
 
 /**
  * @brief 取消已暂存但尚未启动的 OTA 任务。
  *
+ * 仅取消协议与 request_id 均匹配的暂存任务。
+ *
+ * @param gateway_protocol 请求所属协议，与提交请求保持一致。
+ * @param request_id 提交请求的 ID，不能为空；网关协议允许空字符串。
  * @param reason 稳定原因码，可为空。
  */
-void gw_ota_manager_cancel_pending_upgrade(const char *reason);
+void gw_ota_manager_cancel_pending_upgrade(bool gateway_protocol,
+                                           const char *request_id,
+                                           const char *reason);
 
 /**
  * @brief 查询 OTA 管理状态。

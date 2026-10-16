@@ -28,6 +28,7 @@ static size_t written_size, begin_size;
 static unsigned begin_count, end_count, abort_count, boot_count, verify_count;
 static unsigned event_count, legacy_begin_count, legacy_end_count, reboot_count, confirm_count;
 static esp_err_t begin_error, write_error, end_error, boot_error, verify_error, event_error;
+static esp_err_t legacy_reply_publish_error;
 static esp_ota_img_states_t old_state, running_state;
 static bool old_state_exists;
 static const esp_partition_t *selected_boot;
@@ -175,7 +176,7 @@ bool gw_crypto_sha256_hex_to_bytes(const char *hex, uint8_t *out)
     return true;
 }
 esp_err_t gw_mqtt_manager_publish(const char *topic, const char *data, size_t size)
-{ (void)topic; (void)data; (void)size; return ESP_OK; }
+{ (void)topic; (void)data; (void)size; return legacy_reply_publish_error; }
 esp_err_t gw_gateway_publish_event(const char *mt, const char *dt, const cJSON *pd, bool wait)
 {
     assert(strcmp(dt, "plc") == 0);
@@ -203,6 +204,7 @@ static void reset_fixture(void)
     begin_count = end_count = abort_count = boot_count = verify_count = 0U;
     event_count = legacy_begin_count = legacy_end_count = reboot_count = confirm_count = 0U;
     begin_error = write_error = end_error = boot_error = verify_error = event_error = ESP_OK;
+    legacy_reply_publish_error = ESP_OK;
     old_state = running_state = ESP_OTA_IMG_VALID; old_state_exists = true;
     selected_boot = NULL; last_wait = false; reboot_gateway = false; reboot_after_event = false;
     stepping_worker = false;
@@ -318,12 +320,12 @@ static void test_validation_busy_and_borrowed_strings(void)
     strcpy(legacy.request_id, "old"); strcpy(legacy.target_version, "2.0.0"); strcpy(legacy.url, "http://host/raw.bin");
     hash_request(&legacy, payload, sizeof(payload));
     assert(gw_ota_manager_submit_upgrade(&legacy, &result) != ESP_OK && result.code == GW_RESULT_DEVICE_BUSY);
-    gw_ota_manager_cancel_pending_upgrade("test_cancel");
+    gw_ota_manager_cancel_pending_upgrade(true, request.request_id, "test_cancel");
     assert(!gw_ota_manager_is_busy() && legacy_end_count == 0U);
     assert(gw_ota_manager_submit_upgrade(&legacy, &result) == ESP_OK);
     assert(legacy_begin_count == 1U);
     assert(gw_ota_manager_submit_upgrade(&request, &result) != ESP_OK && result.code == GW_RESULT_DEVICE_BUSY);
-    gw_ota_manager_cancel_pending_upgrade("test_cancel");
+    gw_ota_manager_cancel_pending_upgrade(false, legacy.request_id, "test_cancel");
     assert(!gw_ota_manager_is_busy() && legacy_end_count == 1U);
     request = gateway_request();
     partitions[2].size = sizeof(payload);
@@ -341,7 +343,7 @@ static void test_result_attempt_before_reboot_and_progress_disable(void)
     gw_result_t result;
     event_error = ESP_ERR_INVALID_STATE;
     assert(gw_ota_manager_submit_upgrade(&request, &result) == ESP_OK);
-    assert(gw_ota_manager_start_pending_upgrade() == ESP_OK);
+    assert(gw_ota_manager_start_pending_upgrade(true, request.request_id) == ESP_OK);
     run_worker_once();
     assert(event_count == 1U && strcmp(last_mt, "gateway.ota.result") == 0 && last_wait);
     assert(cJSON_GetObjectItemCaseSensitive(last_event, "code")->valueint == 0);
@@ -352,7 +354,7 @@ static void test_result_attempt_before_reboot_and_progress_disable(void)
     assert(reboot_count == 1U && reboot_gateway && reboot_after_event);
     reset_fixture(); request = gateway_request(); request.sha256[0] = request.sha256[0] == '0' ? '1' : '0';
     assert(gw_ota_manager_submit_upgrade(&request, &result) == ESP_OK);
-    assert(gw_ota_manager_start_pending_upgrade() == ESP_OK);
+    assert(gw_ota_manager_start_pending_upgrade(true, request.request_id) == ESP_OK);
     run_worker_once();
     assert(event_count == 1U && last_wait && strcmp(last_mt, "gateway.ota.result") == 0);
     assert(cJSON_GetObjectItemCaseSensitive(last_event, "code")->valueint == 11);
@@ -409,6 +411,8 @@ static void test_conditional_confirmation_at_boot_uptime(void)
     run_worker_once();
     assert(confirm_count == 0U && monotonic_us == 3000000);
 }
+#include "legacy_reply_fixture.h"
+
 int main(void)
 {
     test_streaming_and_header_splits();
@@ -418,7 +422,9 @@ int main(void)
     test_legacy_raw_image();
     test_rollback_only_verified_old_ota();
     test_conditional_confirmation_at_boot_uptime();
+    test_legacy_reply_ownership();
+    test_pending_request_ownership();
     gw_ota_manager_test_reset(); cJSON_Delete(last_event);
-    puts("Gateway OTA host tests passed (streaming, validation, events, legacy raw, rollback, confirmation)");
+    puts("Gateway OTA host tests passed (streaming, validation, events, legacy raw, rollback, confirmation, legacy reply/request ownership)");
     return 0;
 }

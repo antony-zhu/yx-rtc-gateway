@@ -292,6 +292,7 @@ static void net_worker_task(void *arg)
     portENTER_CRITICAL(&s_net_lock);
     s_net_status.worker_running = false;
     s_net_worker_handle = NULL;
+    bool connected = s_net_status.state == GW_NET_STATE_CONNECTED;
     if (err != ESP_OK) {
         ++s_net_status.fail_count;
     }
@@ -300,9 +301,10 @@ static void net_worker_task(void *arg)
     if (err == ESP_OK) {
         char detail[32];
         snprintf(detail, sizeof(detail), "%s ready", profile_name);
-        net_set_state(GW_NET_STATE_CONNECTED, detail);
-        net_post_event(GW_EVT_NET_READY, gw_result_ok());
-        gw_log_write(GW_LOG_LEVEL_INFO, "net", "ready", detail, NULL);
+        if (connected) {
+            net_post_event(GW_EVT_NET_READY, gw_result_ok());
+            gw_log_write(GW_LOG_LEVEL_INFO, "net", "ready", detail, NULL);
+        }
         vTaskDelete(NULL);
         return;
     }

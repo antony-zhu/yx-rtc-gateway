@@ -12,8 +12,8 @@
 
 Cron 格式为 `分钟 小时 日 月 星期`。支持 `*`、单值、范围、列表和步长，例如 `*/5 * * * *`、`0 8 * * 1-5`。星期日可写 `0` 或 `7`。日和星期同时受限时采用 Linux Cron 的 OR 语义。
 
-请求下发到 `/yx_gw/YxzhNode<EFUSE_MAC>/thing/model/down_raw`，应答及主动执行结果从
-`/yx_gw/YxzhNode<EFUSE_MAC>/thing/model/up_raw` 返回；`EFUSE_MAC` 为 ESP32 eFuse MAC
+请求下发到 `yx_gw/YxzhNode<EFUSE_MAC>/thing/model/down_raw`，应答及主动执行结果从
+`yx_gw/YxzhNode<EFUSE_MAC>/thing/model/up_raw` 返回；`EFUSE_MAC` 为 ESP32 eFuse MAC
 的 12 位大写十六进制文本。下列示例省略设备 Topic。
 
 ## 2. 查询命令能力

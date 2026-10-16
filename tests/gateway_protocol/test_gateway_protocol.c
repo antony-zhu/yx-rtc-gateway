@@ -32,9 +32,13 @@ esp_err_t gw_ota_manager_submit_upgrade(const gw_ota_upgrade_request_t *r,gw_res
     result->reason_code=GW_REASON_DEVICE_BUSY;result->detail="busy";
     return s_submit_error;
 }
-esp_err_t gw_ota_manager_start_pending_upgrade(void)
-{ assert(s_published_count>0 || s_publish_error!=ESP_OK);++s_ota_starts;return ESP_OK; }
-void gw_ota_manager_cancel_pending_upgrade(const char *reason) { (void)reason; }
+esp_err_t gw_ota_manager_start_pending_upgrade(bool gateway_protocol,const char *request_id)
+{
+    assert(gateway_protocol && strcmp(request_id,s_submitted.request_id)==0);
+    assert(s_published_count>0 || s_publish_error!=ESP_OK);++s_ota_starts;return ESP_OK;
+}
+void gw_ota_manager_cancel_pending_upgrade(bool gateway_protocol,const char *request_id,const char *reason)
+{ assert(gateway_protocol && strcmp(request_id,s_submitted.request_id)==0);(void)reason; }
 esp_err_t gw_ota_manager_prepare_rollback(gw_result_t *result)
 { ++s_rollback_calls;result->code=0;return ESP_OK; }
 esp_err_t gw_ota_manager_reboot_prepared_rollback(void)

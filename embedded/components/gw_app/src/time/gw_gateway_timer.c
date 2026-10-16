@@ -894,21 +894,8 @@ static bool disable_duration(timer_table_t *table, timer_task_t *task)
     return true;
 }
 
-static bool clock_changed(const gw_time_point_t *now, int16_t offset)
-{
-    if (!s_clock_seen || now->utc_trusted != s_previous_clock.utc_trusted ||
-        offset != s_previous_timezone) {
-        return true;
-    }
-    if (!now->utc_trusted) {
-        return false;
-    }
-    uint64_t expected = s_previous_clock.utc_ms +
-                        (now->uptime_ms - s_previous_clock.uptime_ms);
-    return expected != now->utc_ms;
-}
-
-static esp_err_t reconcile_clock(const gw_time_point_t *now, int16_t offset)
+static esp_err_t reconcile_clock(const gw_time_point_t *now, int16_t offset,
+                                  bool rebase)
 {
     timer_table_t *replacement = copy_table();
     if (replacement == NULL) {
@@ -932,7 +919,9 @@ static esp_err_t reconcile_clock(const gw_time_point_t *now, int16_t offset)
             continue;
         }
         if (task->kind == TIMER_DAILY) {
-            task->next_utc_ms = daily_next(task, now->utc_ms, offset);
+            if (rebase) {
+                task->next_utc_ms = daily_next(task, now->utc_ms, offset);
+            }
             continue;
         }
         if (task->kind == TIMER_DURATION && task->active) {
@@ -967,7 +956,8 @@ static esp_err_t reconcile_clock(const gw_time_point_t *now, int16_t offset)
             task->due_uptime_ms = now->uptime_ms + task->next_utc_ms - now->utc_ms;
             task->due_uptime_valid = true;
         } else {
-            if (task->due_uptime_ms <= now->uptime_ms) {
+            /* Small corrections preserve occurrences crossed while polling paused. */
+            if (rebase && task->due_uptime_ms <= now->uptime_ms) {
                 if (task->kind == TIMER_DURATION) {
                     if (!disable_duration(replacement, task)) {
                         free_table(replacement);
@@ -1178,9 +1168,14 @@ static void timer_poll(void)
 {
     gw_time_point_t now = gw_time_now();
     int16_t offset = timezone_offset();
-    bool changed = clock_changed(&now, offset);
+    bool rebase = !s_clock_seen ||
+                  now.utc_trusted != s_previous_clock.utc_trusted ||
+                  offset != s_previous_timezone;
+    uint64_t expected_utc_ms = s_previous_clock.utc_ms +
+                               (now.uptime_ms - s_previous_clock.uptime_ms);
+    bool changed = rebase || (now.utc_trusted && now.utc_ms != expected_utc_ms);
     bool clock_ready = !s_time_paused &&
-                       (!changed || reconcile_clock(&now, offset) == ESP_OK);
+                       (!changed || reconcile_clock(&now, offset, rebase) == ESP_OK);
     if (clock_ready) {
         s_previous_clock = now;
     }
@@ -1238,7 +1233,7 @@ esp_err_t gw_gateway_timer_init(void)
     esp_err_t err = load_table();
     if (err == ESP_OK) {
         gw_time_point_t now = gw_time_now();
-        err = reconcile_clock(&now, timezone_offset());
+        err = reconcile_clock(&now, timezone_offset(), true);
     }
     if (err == ESP_OK &&
         xTaskCreate(timer_worker, "gateway_timer", 6144U, NULL, 5U, &s_worker) != pdPASS) {
